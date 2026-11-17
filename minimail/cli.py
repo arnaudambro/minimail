@@ -66,7 +66,8 @@ def cmd_account_add(a):
     if a.no_test or _test(acct):
         print(f"Added {acct.name}.")
     else:
-        print(f"Saved {acct.name}, but the login failed. Fix the password with: minimail account password {acct.name}")
+        print(f"Saved {acct.name}, but the check failed (see above). Fix the password with "
+              f"`minimail account password {acct.name}`, or set a folder with `minimail account folder {acct.name} sent <name>`.")
 
 
 def _clean(acct: Account, password: str) -> str:

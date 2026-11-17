@@ -120,17 +120,34 @@ def resolve_folder(m: imaplib.IMAP4, acct: Account, key: str) -> str:
             found = name
             break
     if not found:
-        names = {n.lower(): n for _, n in folders}
-        for cand in _FALLBACKS[key]:
-            if cand.lower() in names:
-                found = names[cand.lower()]
-                break
+        found = _guess(m, folders, key)
     if not found:
         raise RuntimeError(f"[{acct.name}] cannot find the {key} folder; set it with `minimail account folder {acct.name} {key} <name>`")
     cache.setdefault(acct.name, {})[key] = found
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     _FOLDER_CACHE.write_text(json.dumps(cache, indent=2))
     return found
+
+
+def _guess(m: imaplib.IMAP4, folders, key: str) -> str | None:
+    """No SPECIAL-USE flag: match common names, also under a namespace prefix like 'INBOX.'.
+    If several folders match, take the one with the most messages."""
+    wanted = [c.lower() for c in _FALLBACKS[key]]
+    exact = {n.lower(): n for _, n in folders}
+    for cand in wanted:
+        if cand in exact:
+            return exact[cand]
+    matches = [n for _, n in folders if re.split(r"[./]", n)[-1].lower() in wanted]
+    if len(matches) <= 1:
+        return matches[0] if matches else None
+    def count(name):
+        try:
+            typ, data = m.status(quote(name), "(MESSAGES)")
+            mt = re.search(rb"MESSAGES (\d+)", data[0]) if typ == "OK" else None
+            return int(mt.group(1)) if mt else -1
+        except Exception:  # noqa: BLE001
+            return -1
+    return max(matches, key=lambda n: (count(n), -n.count(".")))
 
 
 def forget_folders(acct_name: str) -> None:
