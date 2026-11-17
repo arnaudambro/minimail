@@ -261,6 +261,10 @@ final class Store: ObservableObject {
         unread[account, default: [:]][folder] = max(0, (unread[account]?[folder] ?? 0) + delta)
     }
 
+    func selectAll() {
+        selection = Set(messages.map(\.id))
+    }
+
     func selectionChanged() {
         if selection.count == 1, let id = selection.first {
             if current?.id != id { Task { await open(id) } }

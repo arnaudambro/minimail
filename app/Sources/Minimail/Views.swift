@@ -21,6 +21,21 @@ struct MinimailApp: App {
                 Button("New Message") { store.newMessage() }.keyboardShortcut("n")
                 Button("Add Account…") { store.showAddAccount = true }
             }
+            CommandGroup(replacing: .pasteboard) {
+                Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }.keyboardShortcut("x")
+                Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }.keyboardShortcut("c")
+                Button("Paste") { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }.keyboardShortcut("v")
+                Button("Select All") {
+                    // In a text field (search, compose): select its text. Elsewhere: select every message.
+                    let w = NSApp.keyWindow
+                    if w?.firstResponder is NSText || w == nil || w?.sheetParent != nil
+                        || w?.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true {
+                        NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                    } else {
+                        store.selectAll()
+                    }
+                }.keyboardShortcut("a")
+            }
             CommandMenu("Message") {
                 Button("Reply") { store.reply() }.keyboardShortcut("r").disabled(store.current == nil)
                 Divider()
