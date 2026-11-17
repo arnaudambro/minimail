@@ -21,6 +21,7 @@ struct Draft: Identifiable {
     var subject = ""
     var body = ""
     var replyTo: String?
+    var forwardOf: String?
 }
 
 @MainActor
@@ -477,6 +478,13 @@ final class Store: ObservableObject {
         compose = Draft(account: m.account, to: m.reply_to.isEmpty ? m.from : m.reply_to, subject: subject, replyTo: m.id)
     }
 
+    func forward() {
+        guard let m = current else { return }
+        let s = m.subject
+        let subject = ["fwd:", "fw:", "tr:"].contains(where: { s.lowercased().hasPrefix($0) }) ? s : "Fwd: \(s)"
+        compose = Draft(account: m.account, subject: subject, forwardOf: m.id)
+    }
+
     func send(_ d: Draft) async throws {
         var args = ["send", "--json", "-a", d.account, "--subject", d.subject]
         for addr in d.to.split(separator: ",") {
@@ -484,6 +492,7 @@ final class Store: ObservableObject {
             if !t.isEmpty { args += ["--to", t] }
         }
         if let r = d.replyTo { args += ["--reply", r] }
+        if let f = d.forwardOf { args += ["--forward", f] }
         _ = try await CLI.run(args, input: d.body)
     }
 

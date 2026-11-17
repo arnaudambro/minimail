@@ -38,6 +38,7 @@ struct MinimailApp: App {
             }
             CommandMenu("Message") {
                 Button("Reply") { store.reply() }.keyboardShortcut("r").disabled(store.current == nil)
+                Button("Forward") { store.forward() }.keyboardShortcut("f", modifiers: [.command, .shift]).disabled(store.current == nil)
                 Divider()
                 Button("Mark as Read") { Task { await store.setRead(true) } }.keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Mark as Unread") { Task { await store.setRead(false) } }.keyboardShortcut("u", modifiers: [.command, .option])
@@ -343,6 +344,11 @@ struct DetailView: View {
                     .help("Reply (⌘R)")
                     .disabled(store.current == nil)
             }
+            ToolbarItem {
+                Button { store.forward() } label: { Label("Forward", systemImage: "arrowshape.turn.up.right") }
+                    .help("Forward (⇧⌘F)")
+                    .disabled(store.current == nil)
+            }
         }
     }
 }
@@ -480,6 +486,10 @@ struct ComposeView: View {
                 .scrollContentBackground(.hidden)
                 .padding(.horizontal, 12)
                 .frame(minHeight: 260)
+            if draft.forwardOf != nil {
+                Text("The original email, with its images and attachments, is added below your text.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom, 4)
+            }
             if draft.replyTo != nil {
                 Text("The original message is quoted below your text.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal)

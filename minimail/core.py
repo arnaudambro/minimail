@@ -466,9 +466,52 @@ def delete(ids) -> int:
     return n
 
 
-def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: str | None = None) -> dict:
+def fetch_raw(mid: str) -> bytes:
+    account, folder, uid = parse_id(mid)
+    acct = get_account(account)
+    with imap.session(acct) as m:
+        imap.select(m, acct, folder, readonly=True)
+        rows = imap.fetch(m, [uid], "(UID BODY.PEEK[])")
+    if not rows or not rows[0]["body"]:
+        raise SystemExit(f"Message not found: {mid}")
+    return rows[0]["body"]
+
+
+def _forward_parts(mid: str, note: str):
+    """(subject, text, html or None, attachments) for forwarding message `mid` with a note on top."""
+    text, _, orig = parse_full(fetch_raw(mid))
+    get = lambda k: str(orig.get(k, "") or "")  # noqa: E731
+    fields = [("From", get("from")), ("Date", get("date")), ("Subject", get("subject")), ("To", get("to"))]
+    if get("cc"):
+        fields.append(("Cc", get("cc")))
+    head = "---------- Forwarded message ---------\n" + "\n".join(f"{k}: {v}" for k, v in fields)
+    plain = f"{note}\n\n{head}\n\n{text}\n".lstrip("\n") if note else f"{head}\n\n{text}\n"
+    page = html_of(orig)
+    rich = None
+    if page:
+        note_html = html.escape(note).replace("\n", "<br>")
+        head_html = "---------- Forwarded message ---------<br>" + "<br>".join(
+            f"{k}: {html.escape(v)}" for k, v in fields)
+        rich = (f"<div>{note_html}</div><br><div style=\"color:#555\">{head_html}</div><br>"
+                f"<div>{page}</div>")
+    atts = []
+    for p in orig.iter_attachments():
+        data = p.get_payload(decode=True)
+        if data:
+            atts.append((data, p.get_content_maintype(), p.get_content_subtype(), p.get_filename() or "attachment"))
+    s = get("subject")
+    subject = s if s.lower().startswith(("fwd:", "fw:", "tr:")) else f"Fwd: {s}"
+    return subject, plain, rich, atts
+
+
+def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: str | None = None,
+         forward_id: str | None = None) -> dict:
     acct = get_account(account)
     msg = EmailMessage()
+    rich, atts = None, []
+    if forward_id:
+        fsubject, body, rich, atts = _forward_parts(forward_id, body)
+        subject = subject or fsubject
     msg["From"] = formataddr((acct.display_name, acct.email)) if acct.display_name else acct.email
     to = list(to)
     if reply_to_id:
@@ -492,6 +535,10 @@ def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: 
     msg["Message-ID"] = make_msgid(domain=acct.email.split("@")[-1])
     msg["Date"] = formatdate(localtime=True)
     msg.set_content(body)
+    if rich:
+        msg.add_alternative(rich, subtype="html")
+    for data, maintype, subtype, filename in atts:
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
 
     ctx = ssl.create_default_context()
     if acct.insecure_tls:

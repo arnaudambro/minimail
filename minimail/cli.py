@@ -304,7 +304,7 @@ def cmd_counts(a):
 
 def cmd_send(a):
     body = a.body if a.body is not None else sys.stdin.read()
-    r = core.send(a.account, a.to or [], a.subject or "", body, a.cc or [], a.bcc or [], a.reply)
+    r = core.send(a.account, a.to or [], a.subject or "", body, a.cc or [], a.bcc or [], a.reply, a.forward)
     print(json.dumps(r) if a.json else f"Sent to {', '.join(r['to'])}: {r['subject']}")
 
 
@@ -492,6 +492,7 @@ def build_parser():
     s.add_argument("--subject")
     s.add_argument("--body")
     s.add_argument("--reply", metavar="ID", help="reply to this message id (fills To/Subject/threading)")
+    s.add_argument("--forward", metavar="ID", help="forward this message id (body = your note on top; keeps HTML and attachments)")
     s.set_defaults(fn=cmd_send)
 
     s = sub.add_parser("watch", help="poll inboxes and post notifications (foreground)")
