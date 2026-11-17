@@ -71,14 +71,14 @@ struct Sidebar: View {
             Section("Mailboxes") {
                 ForEach(Folder.allCases) { f in
                     Label(f.title, systemImage: f.icon)
-                        .badge(f == .inbox ? inboxBadge : 0)
+                        .badge(f == .sent ? 0 : store.unreadCount(f, account: store.account))
                         .tag(f)
                 }
             }
             Section("Accounts") {
-                accountRow(nil, title: "All Accounts", count: store.inboxUnread.values.reduce(0, +))
+                accountRow(nil, title: "All Accounts", count: store.unreadCount(.inbox))
                 ForEach(store.accounts) { a in
-                    accountRow(a.name, title: a.email, count: store.inboxUnread[a.name] ?? 0)
+                    accountRow(a.name, title: a.email, count: store.unreadCount(.inbox, account: a.name))
                 }
             }
         }
@@ -86,9 +86,6 @@ struct Sidebar: View {
         .safeAreaInset(edge: .bottom) { SidebarFooter() }
     }
 
-    private var inboxBadge: Int {
-        store.account.map { store.inboxUnread[$0] ?? 0 } ?? store.inboxUnread.values.reduce(0, +)
-    }
 
     private func accountRow(_ name: String?, title: String, count: Int) -> some View {
         let active = store.account == name

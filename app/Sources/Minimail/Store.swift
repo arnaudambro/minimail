@@ -43,7 +43,11 @@ final class Store: ObservableObject {
     @Published var busy = false
     @Published var errors: [String: String] = [:]
     @Published var banner: String?
-    @Published var inboxUnread: [String: Int] = [:]
+    /// Unread counts per account and folder: unread["gmail"]["inbox"].
+    @Published var unread: [String: [String: Int]] = [:]
+    /// Bumped on every optimistic change, so a slower server count cannot overwrite it.
+    private var countsVersion = 0
+    private var inFlight = 0
     @Published var compose: Draft?
     @Published var showAddAccount = false
     @Published var providers: [ProviderInfo] = []
@@ -193,18 +197,29 @@ final class Store: ObservableObject {
     }
 
     func refreshCounts() async {
+        let version = countsVersion
         guard let data = try? await CLI.run(["counts", "--json"]),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let accts = obj["accounts"] as? [String: Any] else { return }
-        var counts: [String: Int] = [:]
+        // Something changed locally while we waited: the server numbers may be stale.
+        guard version == countsVersion, inFlight == 0 else { return }
+        var counts: [String: [String: Int]] = [:]
         for (name, v) in accts {
-            if let inbox = (v as? [String: Any])?["inbox"] as? [String: Any], let n = inbox["unread"] as? Int {
-                counts[name] = n
+            for (folder, c) in (v as? [String: Any]) ?? [:] {
+                if let n = (c as? [String: Any])?["unread"] as? Int { counts[name, default: [:]][folder] = n }
             }
         }
-        inboxUnread = counts
-        let total = counts.values.reduce(0, +)
-        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+        unread = counts
+        updateBadge()
+    }
+
+    func unreadCount(_ folder: Folder, account: String? = nil) -> Int {
+        if let account { return unread[account]?[folder.rawValue] ?? 0 }
+        return unread.values.reduce(0) { $0 + ($1[folder.rawValue] ?? 0) }
+    }
+
+    private func bump(_ account: String, _ folder: String, _ delta: Int) {
+        unread[account, default: [:]][folder] = max(0, (unread[account]?[folder] ?? 0) + delta)
     }
 
     func selectionChanged() {
@@ -220,6 +235,8 @@ final class Store: ObservableObject {
         defer { loadingMessage = false }
         let wasUnread = messages.first { $0.id == id }?.unread ?? false
         if wasUnread { setLocal([id], unread: false); pendingUnread[id] = false }
+        inFlight += 1
+        defer { inFlight -= 1 }
         var args = ["show", id, "--json"]
         if wasUnread { args.append("--mark-read") }
         do {
@@ -245,14 +262,14 @@ final class Store: ObservableObject {
 
     private func setLocal(_ ids: [String], unread: Bool) {
         let set = Set(ids)
+        countsVersion += 1
         for i in messages.indices where set.contains(messages[i].id) {
-            if messages[i].unread != unread, messages[i].folder == "inbox" {
-                inboxUnread[messages[i].account, default: 0] += unread ? 1 : -1
+            if messages[i].unread != unread {
+                bump(messages[i].account, messages[i].folder, unread ? 1 : -1)
             }
             messages[i].unread = unread
         }
-        let total = inboxUnread.values.reduce(0, +)
-        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+        updateBadge()
     }
 
     /// Optimistic: the UI changes at once, the server call runs after, and a failure undoes the change.
@@ -261,6 +278,8 @@ final class Store: ObservableObject {
         guard !ids.isEmpty else { return }
         setLocal(ids, unread: !read)
         for id in ids { pendingUnread[id] = !read }
+        inFlight += 1
+        defer { inFlight -= 1 }
         do {
             _ = try await CLI.run([read ? "mark-read" : "mark-unread", "--json"] + ids)
         } catch {
@@ -272,23 +291,23 @@ final class Store: ObservableObject {
 
     func markAllRead() async {
         let ids = messages.filter(\.unread).map(\.id)
-        let savedCounts = inboxUnread
+        let savedCounts = unread
         setLocal(ids, unread: false)
-        if activeFolder == .inbox {
-            for name in account.map({ [$0] }) ?? Array(inboxUnread.keys) { inboxUnread[name] = 0 }
-            updateBadge()
-        }
+        for name in account.map({ [$0] }) ?? Array(unread.keys) { unread[name, default: [:]][activeFolder.rawValue] = 0 }
+        updateBadge()
         for id in ids { pendingUnread[id] = false }
+        inFlight += 1
         var args = ["mark-read", "--all", "--json", "-f", activeFolder.rawValue]
         if let account { args += ["-a", account] }
         do {
             _ = try await CLI.run(args)
         } catch {
             setLocal(ids, unread: true)
-            inboxUnread = savedCounts
+            unread = savedCounts
             updateBadge()
             banner = error.localizedDescription
         }
+        inFlight -= 1
         for id in ids { pendingUnread[id] = nil }
         await refreshCounts()
     }
@@ -308,9 +327,15 @@ final class Store: ObservableObject {
         guard !ids.isEmpty else { return }
         let set = Set(ids)
         let removed = messages.filter { set.contains($0.id) }
-        let savedCounts = inboxUnread
-        for m in removed where m.unread && m.folder == "inbox" { inboxUnread[m.account, default: 1] -= 1 }
+        let savedCounts = unread
+        countsVersion += 1
+        for m in removed where m.unread {
+            bump(m.account, m.folder, -1)
+            if command == "spam" { bump(m.account, "spam", 1) }
+            if command == "not-spam" { bump(m.account, "inbox", 1) }
+        }
         updateBadge()
+        inFlight += 1
         messages.removeAll { set.contains($0.id) }
         pendingRemoved.formUnion(set)
         selection = []
@@ -319,16 +344,17 @@ final class Store: ObservableObject {
             _ = try await CLI.run([command, "--json"] + ids)
         } catch {
             messages = (messages + removed).sorted { $0.ts > $1.ts }
-            inboxUnread = savedCounts
+            unread = savedCounts
             updateBadge()
             banner = error.localizedDescription
         }
+        inFlight -= 1
         pendingRemoved.subtract(set)
         await refreshCounts()
     }
 
     private func updateBadge() {
-        let total = inboxUnread.values.reduce(0, +)
+        let total = unreadCount(.inbox)
         NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
     }
 
