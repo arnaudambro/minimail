@@ -119,6 +119,8 @@ def cmd_account_remove(a):
     save_accounts(left)
     keychain_delete(a.name)
     imap.forget_folders(a.name)
+    from . import store
+    store.forget_account(a.name)
     print(json.dumps({"removed": a.name}) if a.json else f"Removed {a.name}.")
 
 
@@ -193,18 +195,19 @@ def fmt_row(m, folder):
 
 
 def cmd_list(a):
-    msgs, errors = core.list_messages(a.folder, a.account, a.unread, a.limit, a.search)
+    folder = a.folder or (None if a.search else "inbox")
+    msgs, errors = core.list_messages(folder, a.account, a.unread, a.limit, a.search, live=a.live)
     if a.json:
         return out_json({"messages": msgs, "errors": errors})
     for m in msgs:
-        print(fmt_row(m, a.folder))
+        print(fmt_row(m, m["folder"]))
     if not msgs:
         print("No messages.")
     print_errors(errors)
 
 
 def cmd_show(a):
-    m = core.get_message(a.id, mark_read=a.mark_read)
+    m = core.get_message(a.id, mark_read=a.mark_read, live=a.live)
     if a.json:
         return out_json(m)
     print(f"From:    {m['from']}\nTo:      {m['to']}")
@@ -248,8 +251,29 @@ def cmd_delete(a):
     print(json.dumps({"deleted": n}) if a.json else f"Moved {n} to Trash.")
 
 
+def cmd_sync(a):
+    from . import store
+    accts = core.pick_accounts(a.account)
+    results, errors = core.parallel(lambda x: len(store.sync_account(x, bodies=a.bodies)), accts)
+    if a.json:
+        return out_json({"new": results, "errors": errors})
+    if not a.quiet:
+        for k, v in results.items():
+            print(f"{k}: {v} new")
+        print_errors(errors)
+
+
+def cmd_contacts(a):
+    from . import store
+    rows = store.contacts(store.connect(), a.query or "", a.limit)
+    if a.json:
+        return out_json(rows)
+    for r in rows:
+        print(f"{r['email']:<40} {r['name'] or '':<30} sent={r['sent']} received={r['received']}")
+
+
 def cmd_counts(a):
-    results, errors = core.unread_counts(a.account)
+    results, errors = core.unread_counts(a.account, live=a.live)
     if a.json:
         return out_json({"accounts": results, "errors": errors})
     print(f"{'account':<16} {'inbox':>12} {'sent':>8} {'spam':>12}")
@@ -274,7 +298,7 @@ def cmd_send(a):
 
 def cmd_watch(a):
     from .watch import Watcher
-    Watcher(a.interval).run()
+    Watcher(a.interval, emit=a.emit).run()
 
 
 MX_HINTS = [
@@ -326,7 +350,7 @@ def cmd_daemon(a):
     if a.action == "install":
         if not core.notifier():
             print("warning: terminal-notifier not found. Install it: brew install terminal-notifier", file=sys.stderr)
-        print(f"Installed {watch.install_agent(a.interval)}. Logs: {watch.LOG}")
+        print(f"Installed {watch.install_agent(a.interval, a.agent)}. Logs: {watch.LOG}")
     elif a.action == "uninstall":
         watch.uninstall_agent()
         print("Uninstalled.")
@@ -402,15 +426,17 @@ def build_parser():
     s.add_argument("email"); s.set_defaults(fn=cmd_detect)
 
     s = j(sub.add_parser("list", help="list latest messages, newest first"))
-    s.add_argument("--folder", "-f", **folder_kw)
+    s.add_argument("--folder", "-f", choices=imap.FOLDER_KEYS, help="default inbox; with --search, all folders")
     s.add_argument("--account", "-a", action="append", help="repeatable; default all")
     s.add_argument("--unread", "-u", action="store_true")
     s.add_argument("--limit", "-n", type=int, default=20, help="per account (default 20)")
-    s.add_argument("--search", "-s", help="IMAP full-text search")
+    s.add_argument("--search", "-s", help="full-text search (subject, people, body)")
+    s.add_argument("--live", action="store_true", help="ask the servers instead of the local cache")
     s.set_defaults(fn=cmd_list)
 
     s = j(sub.add_parser("show", help="print one message (does not mark it read)"))
-    s.add_argument("id"); s.add_argument("--mark-read", action="store_true"); s.set_defaults(fn=cmd_show)
+    s.add_argument("id"); s.add_argument("--mark-read", action="store_true"); s.add_argument("--live", action="store_true")
+    s.set_defaults(fn=cmd_show)
 
     for name, seen in (("mark-read", True), ("mark-unread", False)):
         s = j(sub.add_parser(name))
@@ -430,7 +456,18 @@ def build_parser():
     s.set_defaults(fn=cmd_delete)
 
     s = j(sub.add_parser("counts", help="unread/total per account and folder"))
-    s.add_argument("--account", "-a", action="append"); s.set_defaults(fn=cmd_counts)
+    s.add_argument("--account", "-a", action="append"); s.add_argument("--live", action="store_true")
+    s.set_defaults(fn=cmd_counts)
+
+    s = j(sub.add_parser("sync", help="update the local cache from the servers"))
+    s.add_argument("--account", "-a", action="append")
+    s.add_argument("--bodies", type=int, default=60, help="text bodies to fetch per folder (default 60)")
+    s.add_argument("--quiet", "-q", action="store_true")
+    s.set_defaults(fn=cmd_sync)
+
+    s = j(sub.add_parser("contacts", help="known addresses, most used first (from your mail)"))
+    s.add_argument("query", nargs="?"); s.add_argument("--limit", "-n", type=int, default=10)
+    s.set_defaults(fn=cmd_contacts)
 
     s = j(sub.add_parser("send", help="send an email (body from --body or stdin)"))
     s.add_argument("--account", "-a", required=True)
@@ -441,10 +478,14 @@ def build_parser():
     s.set_defaults(fn=cmd_send)
 
     s = sub.add_parser("watch", help="poll inboxes and post notifications (foreground)")
-    s.add_argument("--interval", type=int, default=60); s.set_defaults(fn=cmd_watch)
+    s.add_argument("--interval", type=int, default=30)
+    s.add_argument("--emit", action="store_true", help="print notifications as JSON lines instead of posting them")
+    s.set_defaults(fn=cmd_watch)
     s = j(sub.add_parser("daemon", help="run the watcher at login via launchd"))
     s.add_argument("action", choices=["install", "uninstall", "status"])
-    s.add_argument("--interval", type=int, default=60); s.set_defaults(fn=cmd_daemon)
+    s.add_argument("--interval", type=int, default=30)
+    s.add_argument("--agent", help="run this notifier app binary instead (it starts `minimail watch --emit` itself)")
+    s.set_defaults(fn=cmd_daemon)
 
     sub.add_parser("tui", help="interactive terminal UI (default)").set_defaults(fn=cmd_tui)
     s = sub.add_parser("install-skill", help="install the Claude Code skill")

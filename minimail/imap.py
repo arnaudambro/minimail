@@ -186,6 +186,7 @@ def uidset(uids) -> str:
 _UID_RE = re.compile(rb"UID (\d+)")
 _FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
 _DATE_RE = re.compile(rb'INTERNALDATE "([^"]+)"')
+_SIZE_RE = re.compile(rb"RFC822\.SIZE (\d+)")
 
 
 def fetch(m: imaplib.IMAP4, uids, items: str) -> list[dict]:
@@ -213,7 +214,9 @@ def fetch(m: imaplib.IMAP4, uids, items: str) -> list[dict]:
             if mu:
                 mf = _FLAGS_RE.search(meta)
                 md = _DATE_RE.search(meta)
+                ms = _SIZE_RE.search(meta)
                 out.append({
+                    "size": int(ms.group(1)) if ms else None,
                     "uid": int(mu.group(1)),
                     "flags": mf.group(1).decode().split() if mf else [],
                     "internaldate": md.group(1).decode() if md else None,

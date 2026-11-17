@@ -19,7 +19,9 @@ from email.message import EmailMessage
 from email.parser import BytesHeaderParser, BytesParser
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 
-from . import imap
+import json
+
+from . import imap, store
 from .config import Account, get_account, load_accounts
 
 HEADER_ITEMS = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])"
@@ -114,9 +116,32 @@ def short_from(addr: str) -> str:
 
 # ---------------------------------------------------------------- read
 
-def list_messages(folder="inbox", accounts=None, unread_only=False, limit=30, search=None):
-    """Latest messages across accounts, newest first. Returns (messages, errors)."""
+def ensure_fresh(accts, folders, max_age=90.0) -> dict:
+    """Sync accounts whose cache for `folders` is older than max_age seconds. Returns errors."""
+    db = store.connect()
+    stale = []
+    for a in accts:
+        for f in folders:
+            if time.time() - store.synced_accounts(db, f).get(a.name, 0) > max_age:
+                stale.append(a)
+                break
+    if not stale:
+        return {}
+    _, errors = parallel(lambda a: store.sync_account(a, folders, bodies=0), stale)
+    return errors
+
+
+def list_messages(folder="inbox", accounts=None, unread_only=False, limit=30, search=None, live=False):
+    """Latest messages across accounts, newest first. Returns (messages, errors).
+
+    Reads the local cache (synced first if older than 90 s). live=True asks the servers directly."""
     accts = pick_accounts(accounts)
+    if not live:
+        folders = list(imap.FOLDER_KEYS) if (search and folder is None) else [folder]
+        errors = ensure_fresh(accts, folders)
+        db = store.connect()
+        msgs = store.query(db, folder, [a.name for a in accts], unread_only, limit, search)
+        return msgs, errors
 
     def one(acct: Account):
         with imap.session(acct) as m:
@@ -135,8 +160,13 @@ def list_messages(folder="inbox", accounts=None, unread_only=False, limit=30, se
     return msgs, errors
 
 
-def unread_counts(accounts=None):
+def unread_counts(accounts=None, live=False):
     accts = pick_accounts(accounts)
+    if not live:
+        errors = ensure_fresh(accts, list(imap.FOLDER_KEYS))
+        c = store.counts(store.connect())
+        empty = {"total": 0, "unread": 0}
+        return {a.name: {k: c.get(a.name, {}).get(k, empty) for k in imap.FOLDER_KEYS} for a in accts}, errors
 
     def one(acct: Account):
         out = {}
@@ -182,9 +212,42 @@ def html_to_text(s: str) -> str:
     return re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
 
 
-def get_message(mid: str, mark_read=False) -> dict:
+def parse_full(raw: bytes):
+    """Return (text body, attachments, parsed message) from a raw RFC822 message."""
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    body = ""
+    part = msg.get_body(preferencelist=("plain", "html"))
+    if part is not None:
+        try:
+            body = part.get_content()
+        except Exception:  # noqa: BLE001
+            body = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+        if part.get_content_type() == "text/html":
+            body = html_to_text(body)
+    attachments = []
+    for p in msg.iter_attachments():
+        try:
+            size = len(p.get_payload(decode=True) or b"")
+        except Exception:  # noqa: BLE001
+            size = 0
+        attachments.append({"filename": p.get_filename(), "type": p.get_content_type(), "size": size})
+    return body.strip(), attachments, msg
+
+
+def get_message(mid: str, mark_read=False, live=False) -> dict:
     account, folder, uid = parse_id(mid)
     acct = get_account(account)
+    if not live:
+        db = store.connect()
+        r = store.get(db, account, folder, uid)
+        if r is not None and r["body"] is not None:
+            info = store.row_to_summary(r)
+            info.update({"cc": r["cc"] or "", "reply_to": r["reply_to"] or "", "references": r["refs"] or "",
+                         "body": r["body"], "attachments": json.loads(r["attachments"] or "[]")})
+            if mark_read and info["unread"]:
+                set_seen([mid], True)
+                info["unread"] = False
+            return info
     with imap.session(acct) as m:
         imap.select(m, acct, folder, readonly=not mark_read)
         rows = imap.fetch(m, [uid], "(UID FLAGS INTERNALDATE BODY.PEEK[])")
@@ -193,20 +256,7 @@ def get_message(mid: str, mark_read=False) -> dict:
         row = rows[0]
         if mark_read:
             m.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Seen)")
-    msg = BytesParser(policy=policy.default).parsebytes(row["body"])
-    body = ""
-    part = msg.get_body(preferencelist=("plain", "html"))
-    if part is not None:
-        try:
-            body = part.get_content()
-        except Exception:  # noqa: BLE001
-            body = part.get_payload(decode=True).decode("utf-8", "replace")
-        if part.get_content_type() == "text/html":
-            body = html_to_text(body)
-    attachments = [
-        {"filename": p.get_filename(), "type": p.get_content_type(), "size": len(p.get_payload(decode=True) or b"")}
-        for p in msg.iter_attachments()
-    ]
+    body, attachments, msg = parse_full(row["body"])
     info = _summary(acct, folder, {"uid": uid, "flags": row["flags"], "internaldate": row["internaldate"], "body": row["body"]})
     if mark_read:
         info["unread"] = False
@@ -214,9 +264,16 @@ def get_message(mid: str, mark_read=False) -> dict:
         "cc": str(msg.get("cc", "") or ""),
         "reply_to": str(msg.get("reply-to", "") or ""),
         "references": str(msg.get("references", "") or ""),
-        "body": body.strip(),
+        "body": body,
         "attachments": attachments,
     })
+    try:
+        db = store.connect()
+        store.store_body(db, account, folder, uid, body, attachments, info["cc"], info["reply_to"], info["references"])
+        if mark_read:
+            store.set_unread(db, account, folder, [uid], False)
+    except Exception:  # noqa: BLE001
+        pass
     if mark_read:
         clear_notifications([mid])
     return info
@@ -233,6 +290,7 @@ def set_seen(ids, seen=True) -> int:
             for part in imap.chunks(uids):
                 m.uid("STORE", imap.uidset(part), "+FLAGS.SILENT" if seen else "-FLAGS.SILENT", "(\\Seen)")
                 n += len(part)
+        store.set_unread(store.connect(), account, folder, uids, not seen)
     if seen:
         clear_notifications(ids)
     return n
@@ -247,7 +305,8 @@ def mark_all_read(folder="inbox", accounts=None):
             uids = imap.search_uids(m, "UNSEEN")
             for part in imap.chunks(uids):
                 m.uid("STORE", imap.uidset(part), "+FLAGS.SILENT", "(\\Seen)")
-            return len(uids)
+        store.set_all_read(store.connect(), acct.name, folder)
+        return len(uids)
 
     results, errors = parallel(one, accts)
     if folder == "inbox":
@@ -281,6 +340,7 @@ def move(ids, dest: str) -> int:
                 if typ != "OK":
                     raise RuntimeError(f"[{account}] move failed: {data}")
                 n += len(part)
+        store.remove(store.connect(), account, folder, uids)
     clear_notifications(ids)
     return n
 
@@ -309,6 +369,7 @@ def delete(ids) -> int:
                 else:
                     m.expunge()
                 n += len(part)
+        store.remove(store.connect(), account, folder, uids)
     clear_notifications(ids)
     return n
 

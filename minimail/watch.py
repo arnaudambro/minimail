@@ -16,10 +16,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import core, imap
+from . import core, imap, store
 from .config import STATE_DIR, Account, load_accounts
 
-STATE_FILE = STATE_DIR / "watch.json"
 MAX_SINGLE = 4  # above this many new messages per account, send one summary notification
 LABEL = "dev.minimail.watch"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -27,7 +26,8 @@ LOG = Path.home() / "Library" / "Logs" / "minimail.log"
 
 
 def log(msg: str) -> None:
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    # stderr, so stdout stays clean for --emit JSON lines
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr, flush=True)
 
 
 def self_command() -> list[str]:
@@ -50,17 +50,17 @@ def notify(title: str, subtitle: str, message: str, group: str, on_click: list[s
 
 
 class Watcher:
-    def __init__(self, interval: int = 60):
-        self.interval = interval
-        self.conns: dict[str, object] = {}
-        try:
-            self.state = json.loads(STATE_FILE.read_text())
-        except Exception:
-            self.state = {}
+    """Keeps one IMAP connection per account, syncs the local cache, and announces new mail.
 
-    def save(self):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(self.state, indent=2))
+    emit=True prints one JSON line per notification on stdout (read by the Minimail agent app,
+    which shows native notifications); otherwise terminal-notifier is used.
+    """
+
+    def __init__(self, interval: int = 30, emit: bool = False):
+        self.interval = interval
+        self.emit = emit
+        self.conns: dict[str, object] = {}
+        self.parent = os.getppid()
 
     def conn(self, acct: Account):
         m = self.conns.get(acct.name)
@@ -79,35 +79,29 @@ class Watcher:
 
     def check(self, acct: Account) -> list[dict]:
         try:
-            return self._check(acct)
+            new = store.sync_account(acct, m=self.conn(acct))
         except Exception as e:  # noqa: BLE001
             log(f"[{acct.name}] {type(e).__name__}: {e}")
             self.drop(acct)
             return []
-
-    def _check(self, acct: Account) -> list[dict]:
-        m = self.conn(acct)
-        imap.select(m, acct, "inbox", readonly=True)  # re-select refreshes the mailbox
-        uidvalidity = (m.response("UIDVALIDITY")[1] or [b"0"])[-1]
-        uidvalidity = uidvalidity.decode() if isinstance(uidvalidity, bytes) else str(uidvalidity)
-        st = self.state.get(acct.name)
-        if not st or st.get("uidvalidity") != uidvalidity:
-            uids = imap.search_uids(m, "ALL")
-            self.state[acct.name] = {"uidvalidity": uidvalidity, "last_uid": max(uids) if uids else 0}
-            return []
-        last = st["last_uid"]
-        new = [u for u in imap.search_uids(m, "UID", f"{last + 1}:*") if u > last]
-        if not new:
-            return []
-        st["last_uid"] = max(new)
-        unseen = set(imap.search_uids(m, "UNSEEN"))
-        new = [u for u in new if u in unseen]
-        if not new:
-            return []
-        rows = imap.fetch(m, new, core.HEADER_ITEMS)
-        return [core._summary(acct, "inbox", r) for r in rows]
+        recent = time.time() - 2 * 86400
+        return [x for x in new if x["folder"] == "inbox" and x["unread"] and x["ts"] > recent]
 
     def announce(self, acct: Account, msgs: list[dict]) -> None:
+        msgs = sorted(msgs, key=lambda x: x["ts"])
+        if self.emit:
+            if len(msgs) > MAX_SINGLE:
+                senders = ", ".join(dict.fromkeys(core.short_from(x["from"]) for x in msgs))
+                payload = [{"ids": [x["id"] for x in msgs], "title": f"{len(msgs)} new emails",
+                            "subtitle": acct.email, "body": senders[:200], "account": acct.email}]
+            else:
+                payload = [{"ids": [x["id"]], "title": core.short_from(x["from"]),
+                            "subtitle": x["subject"] or "(no subject)",
+                            "body": " ".join((x.get("body") or "").split())[:180], "account": acct.email}
+                           for x in msgs]
+            for p in payload:
+                print(json.dumps(p, ensure_ascii=False), flush=True)
+            return
         cmd = self_command()
         if len(msgs) > MAX_SINGLE:
             ids = [x["id"] for x in msgs]
@@ -122,6 +116,9 @@ class Watcher:
     def run(self):
         log(f"watching {len(load_accounts())} accounts every {self.interval}s")
         while True:
+            if self.emit and os.getppid() != self.parent:
+                log("agent app is gone, exiting")
+                return
             accts = load_accounts()  # reload so new accounts are picked up
             with ThreadPoolExecutor(max_workers=max(1, min(16, len(accts)))) as ex:
                 results = list(zip(accts, ex.map(self.check, accts)))
@@ -129,14 +126,13 @@ class Watcher:
                 if msgs:
                     log(f"[{acct.name}] {len(msgs)} new")
                     self.announce(acct, msgs)
-            self.save()
             time.sleep(self.interval)
 
 
 # ---------------------------------------------------------------- launchd
 
-def install_agent(interval: int) -> str:
-    cmd = self_command() + ["watch", "--interval", str(interval)]
+def install_agent(interval: int, agent: str | None = None) -> str:
+    cmd = [agent] if agent else self_command() + ["watch", "--interval", str(interval)]
     args = "\n".join(f"    <string>{a}</string>" for a in cmd)
     path = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     PLIST.parent.mkdir(parents=True, exist_ok=True)
