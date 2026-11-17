@@ -248,6 +248,40 @@ def parse_full(raw: bytes):
     return body.strip(), attachments, msg
 
 
+MAX_HTML = 6_000_000
+_SCRIPT_RE = re.compile(r"<script\b.*?</script\s*>", re.I | re.S)
+
+
+def html_of(msg) -> str:
+    """The HTML part, with inline (cid:) images embedded as data: URIs and scripts removed. '' if none."""
+    if msg is None:
+        return ""
+    part = msg.get_body(preferencelist=("html",))
+    if part is None:
+        return ""
+    try:
+        doc = part.get_content()
+    except Exception:  # noqa: BLE001
+        doc = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+    if not isinstance(doc, str):
+        return ""
+    doc = _SCRIPT_RE.sub("", doc)
+    if "cid:" in doc:
+        import base64
+        budget = MAX_HTML - len(doc)
+        for p in msg.walk():
+            cid = str(p.get("content-id", "") or "").strip().strip("<>")
+            if not cid or p.get_content_maintype() != "image" or f"cid:{cid}" not in doc:
+                continue
+            data = p.get_payload(decode=True) or b""
+            uri = f"data:{p.get_content_type()};base64,{base64.b64encode(data).decode()}"
+            if len(uri) > budget:
+                continue
+            budget -= len(uri)
+            doc = doc.replace(f"cid:{cid}", uri)
+    return doc if len(doc) <= MAX_HTML else ""
+
+
 def unsubscribe_info(header: str) -> dict:
     """Parse List-Unsubscribe: '<https://...>, <mailto:...>'."""
     urls = re.findall(r"<([^>]+)>", header or "")
@@ -295,7 +329,7 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
     if not live:
         db = store.connect()
         r = store.get(db, account, folder, uid)
-        if r is not None and r["body"] is not None:
+        if r is not None and r["body"] is not None and r["html"] is not None:
             info = store.row_to_summary(r)
             info.update({"cc": r["cc"] or "", "reply_to": r["reply_to"] or "", "references": r["refs"] or "",
                          "body": r["body"], "attachments": json.loads(r["attachments"] or "[]"),
@@ -327,7 +361,7 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
     try:
         db = store.connect()
         store.store_body(db, account, folder, uid, body, attachments, info["cc"], info["reply_to"], info["references"],
-                         str(msg.get("list-unsubscribe", "") or ""))
+                         str(msg.get("list-unsubscribe", "") or ""), html_of(msg))
         if mark_read:
             store.set_unread(db, account, folder, [uid], False)
     except Exception:  # noqa: BLE001

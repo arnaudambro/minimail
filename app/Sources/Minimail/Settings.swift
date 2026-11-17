@@ -7,6 +7,7 @@ struct SettingsView: View {
         TabView {
             AccountsSettings().tabItem { Label("Accounts", systemImage: "at") }
             NotificationSettings().tabItem { Label("Notifications", systemImage: "bell") }
+            PrivacySettings().tabItem { Label("Privacy", systemImage: "hand.raised") }
         }
         .frame(width: 560, height: 400)
     }
@@ -103,6 +104,25 @@ struct NotificationSettings: View {
         }
         .formStyle(.grouped)
         .task { await store.loadNotif() }
+    }
+}
+
+struct PrivacySettings: View {
+    @AppStorage("loadRemoteContent") private var loadRemote = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Always load images in emails", isOn: $loadRemote)
+                Text("Images in emails often come from the sender's server. When they load, the sender can see that you opened the email, when, and your IP address. When this is off, click \"Load Images\" on an email to show its images.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Text("Emails never run code in Minimail: JavaScript, forms and page changes are blocked. Links open in your browser.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

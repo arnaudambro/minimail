@@ -40,6 +40,8 @@ struct FullMessage: Codable, Identifiable {
     let body: String
     let attachments: [Attachment]
     var unsubscribe: Bool? = nil
+    /// nil: not parsed yet, "": plain-text message.
+    var html: String? = nil
 }
 
 struct UnsubscribeResult: Codable {

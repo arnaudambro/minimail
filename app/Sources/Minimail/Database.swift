@@ -110,14 +110,15 @@ final class MailDB {
     }
 
     func fullMessage(_ m: Message) -> FullMessage? {
-        rows("SELECT sender, recipients, cc, subject, reply_to, body, attachments, list_unsub FROM messages "
+        rows("SELECT sender, recipients, cc, subject, reply_to, body, attachments, list_unsub, html FROM messages "
              + "WHERE account=? AND folder=? AND uid=?", [m.account, m.folder, m.uid]) { r -> FullMessage? in
             guard let body = r.optString(5) else { return nil }
             let atts = (try? JSONDecoder().decode([Attachment].self, from: Data(r.string(6).utf8))) ?? []
             let date = m.ts > 0 ? ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: m.ts)) : ""
             return FullMessage(id: m.id, account: m.account, folder: m.folder, from: r.string(0), to: r.string(1),
                                cc: r.string(2), subject: r.string(3), date: date, reply_to: r.string(4),
-                               body: body, attachments: atts, unsubscribe: !r.string(7).isEmpty)
+                               body: body, attachments: atts, unsubscribe: !r.string(7).isEmpty,
+                               html: r.optString(8))
         }.first ?? nil
     }
 

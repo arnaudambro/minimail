@@ -106,19 +106,26 @@ struct Sidebar: View {
     private func accountRow(_ name: String?, title: String, count: Int) -> some View {
         let active = store.account == name
         return HStack {
-            Image(systemName: active ? "largecircle.fill.circle" : "circle")
-                .foregroundStyle(active ? Color.accentColor : .secondary)
-                .font(.caption)
+            Image(systemName: name == nil ? "tray.2" : "person.crop.circle")
+                .foregroundStyle(active ? Color.white : Color.accentColor)
             Text(title).lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(active ? Color.white : Color.primary)
+                .fontWeight(active ? .semibold : .regular)
             Spacer()
             if store.errors[name ?? ""] != nil {
-                Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange).help(store.errors[name ?? ""] ?? "")
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(active ? .white : .orange)
+                    .help(store.errors[name ?? ""] ?? "")
             } else if count > 0 {
-                Text("\(count)").foregroundStyle(.secondary).font(.callout)
+                Text("\(count)").font(.callout)
+                    .foregroundStyle(active ? Color.white : Color.secondary)
             }
         }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 6).fill(active ? Color.accentColor : Color.clear))
         .contentShape(Rectangle())
         .onTapGesture { store.account = name }
+        .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
     }
 }
 
@@ -359,43 +366,76 @@ struct UnsubscribeButton: View {
 
 struct MessageView: View {
     let message: FullMessage
+    @AppStorage("loadRemoteContent") private var alwaysLoadRemote = false
+    @State private var loadRemote = false
+
+    private var html: String? {
+        guard let h = message.html, !h.isEmpty else { return nil }
+        return h
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(message.subject.isEmpty ? "(no subject)" : message.subject)
-                    .font(.title2.weight(.semibold))
-                HStack(alignment: .firstTextBaseline) {
-                    Text(senderName(message.from)).font(.headline)
-                    Text(senderEmail(message.from)).foregroundStyle(.secondary)
-                    Spacer()
-                    if message.unsubscribe == true {
-                        UnsubscribeButton(id: message.id)
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .textSelection(.enabled)
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 12)
+            Divider()
+            if let html {
+                if !alwaysLoadRemote && !loadRemote && HTMLView.hasRemoteContent(html) {
+                    HStack {
+                        Image(systemName: "photo").foregroundStyle(.secondary)
+                        Text("Images are blocked to protect your privacy.").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Load Images") { loadRemote = true }
                     }
-                    Text(formattedDate).font(.caption).foregroundStyle(.secondary)
+                    .font(.callout)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 6)
+                    Divider()
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("To: \(message.to)")
-                    if !message.cc.isEmpty { Text("Cc: \(message.cc)") }
-                    Text("Account: \(message.account)")
+                HTMLView(html: html, remoteContent: alwaysLoadRemote || loadRemote)
+            } else {
+                ScrollView {
+                    Text(linkified(message.body))
+                        .font(.body)
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
+                        .padding(24)
+                        .frame(maxWidth: 760, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                if !message.attachments.isEmpty {
-                    Label(message.attachments.map { $0.filename ?? $0.type }.joined(separator: ", "), systemImage: "paperclip")
-                        .font(.caption)
-                }
-                Divider()
-                Text(linkified(message.body))
-                    .font(.body)
-                    .lineSpacing(3)
             }
-            .textSelection(.enabled)
-            .padding(24)
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .id(message.id)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(message.subject.isEmpty ? "(no subject)" : message.subject)
+                .font(.title2.weight(.semibold))
+            HStack(alignment: .firstTextBaseline) {
+                Text(senderName(message.from)).font(.headline)
+                Text(senderEmail(message.from)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if message.unsubscribe == true {
+                    UnsubscribeButton(id: message.id)
+                }
+                Text(formattedDate).font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("To: \(message.to)")
+                if !message.cc.isEmpty { Text("Cc: \(message.cc)") }
+                Text("Account: \(message.account)")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            if !message.attachments.isEmpty {
+                Label(message.attachments.map { $0.filename ?? $0.type }.joined(separator: ", "), systemImage: "paperclip")
+                    .font(.caption)
+            }
+        }
     }
 
     private var formattedDate: String {

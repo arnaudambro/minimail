@@ -25,7 +25,7 @@ MAX_BODY_SIZE = 3_000_000
 
 HEADER_ITEMS = ("(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS "
                 "(FROM TO CC SUBJECT DATE MESSAGE-ID REPLY-TO REFERENCES LIST-UNSUBSCRIBE)])")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS messages(
   account TEXT NOT NULL, folder TEXT NOT NULL, uid INTEGER NOT NULL,
   message_id TEXT, sender TEXT, recipients TEXT, cc TEXT, reply_to TEXT, refs TEXT,
   subject TEXT, ts REAL, unread INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0,
-  size INTEGER, body TEXT, attachments TEXT, list_unsub TEXT,
+  size INTEGER, body TEXT, attachments TEXT, list_unsub TEXT, html TEXT,
   UNIQUE(account, folder, uid));
 CREATE INDEX IF NOT EXISTS messages_folder_ts ON messages(folder, ts DESC);
 CREATE INDEX IF NOT EXISTS messages_account_folder_ts ON messages(account, folder, ts DESC);
@@ -86,6 +86,9 @@ def _migrate(db) -> None:
     cols = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
     if "list_unsub" not in cols:
         db.execute("ALTER TABLE messages ADD COLUMN list_unsub TEXT")
+    if "html" not in cols:
+        # NULL = not parsed yet (filled by the prefetch or on open), '' = the message has no HTML part.
+        db.execute("ALTER TABLE messages ADD COLUMN html TEXT")
     if version < 2:
         # v2 keeps links in bodies: parse them again (prefetch refills them progressively).
         db.execute("UPDATE messages SET body=NULL, attachments=NULL")
@@ -185,11 +188,11 @@ def remove(db, account: str, folder: str, uids) -> None:
 
 
 def store_body(db, account: str, folder: str, uid: int, body: str, attachments: list, cc="", reply_to="", refs="",
-               list_unsub="") -> None:
-    db.execute("UPDATE messages SET body=?, attachments=?, cc=COALESCE(NULLIF(?, ''), cc), "
+               list_unsub="", html="") -> None:
+    db.execute("UPDATE messages SET body=?, attachments=?, html=?, cc=COALESCE(NULLIF(?, ''), cc), "
                "reply_to=COALESCE(NULLIF(?, ''), reply_to), refs=COALESCE(NULLIF(?, ''), refs), "
                "list_unsub=COALESCE(NULLIF(?, ''), list_unsub) WHERE account=? AND folder=? AND uid=?",
-               (body, json.dumps(attachments), cc, reply_to, refs, list_unsub, account, folder, uid))
+               (body, json.dumps(attachments), html, cc, reply_to, refs, list_unsub, account, folder, uid))
     db.commit()
 
 
@@ -231,7 +234,7 @@ def _update_contacts(db, rows: list[tuple]) -> None:
 
 def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -> list[dict]:
     """Bring one folder of the cache up to date. Returns new messages (not on the first sync)."""
-    from .core import parse_full
+    from .core import html_of, parse_full
 
     imap.select(m, acct, key, readonly=True)
     typ, data = m.response("UIDVALIDITY")
@@ -274,8 +277,8 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
     # Text bodies, newest first, so opening and searching recent mail is instant.
     if bodies:
         missing = [r["uid"] for r in db.execute(
-            "SELECT uid FROM (SELECT uid, body, size FROM messages WHERE account=? AND folder=? ORDER BY ts DESC LIMIT ?) "
-            "WHERE body IS NULL AND COALESCE(size, 0) < ? LIMIT ?",
+            "SELECT uid FROM (SELECT uid, body, html, size FROM messages WHERE account=? AND folder=? ORDER BY ts DESC LIMIT ?) "
+            "WHERE (body IS NULL OR html IS NULL) AND COALESCE(size, 0) < ? LIMIT ?",
             (acct.name, key, BODY_WINDOW, MAX_BODY_SIZE, bodies))]
         for part in imap.chunks(missing, 20):
             for r in imap.fetch(m, part, "(UID BODY.PEEK[])"):
@@ -283,10 +286,14 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
                     body, atts, msg = parse_full(r["body"])
                 except Exception:  # noqa: BLE001
                     body, atts, msg = "", [], None
+                try:
+                    page = html_of(msg)
+                except Exception:  # noqa: BLE001
+                    page = ""
                 unsub = str(msg.get("list-unsubscribe", "") or "") if msg is not None else ""
-                db.execute("UPDATE messages SET body=?, attachments=?, list_unsub=COALESCE(NULLIF(?, ''), list_unsub) "
+                db.execute("UPDATE messages SET body=?, attachments=?, html=?, list_unsub=COALESCE(NULLIF(?, ''), list_unsub) "
                            "WHERE account=? AND folder=? AND uid=?",
-                           (body, json.dumps(atts), unsub, acct.name, key, r["uid"]))
+                           (body, json.dumps(atts), page, unsub, acct.name, key, r["uid"]))
             db.commit()
 
     db.execute("INSERT INTO folders(account, folder, uidvalidity, synced) VALUES (?,?,?,?) "

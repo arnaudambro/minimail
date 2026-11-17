@@ -280,6 +280,16 @@ final class Store: ObservableObject {
         // 1. Instant: the body is usually already in the local cache.
         if let db, let cached = await withCheckedContinuation({ c in db.queue.async { c.resume(returning: db.fullMessage(msg)) } }) {
             if selection == [id] { current = cached }
+            if cached.html == nil {
+                // Synced before HTML was stored: fetch it once in the background, then show it.
+                Task {
+                    _ = try? await CLI.run(["show", "--json", id])
+                    if selection == [id], let full = await withCheckedContinuation({ c in
+                        db.queue.async { c.resume(returning: db.fullMessage(msg)) } }) {
+                        current = full
+                    }
+                }
+            }
             if wasUnread {
                 inFlight += 1
                 defer { inFlight -= 1 }
@@ -299,9 +309,13 @@ final class Store: ObservableObject {
         var args = ["show", id, "--json"]
         if wasUnread { args.append("--mark-read") }
         do {
-            let m = try await CLI.json(FullMessage.self, args)
+            var m = try await CLI.json(FullMessage.self, args)
             pendingUnread[id] = nil
             guard selection == [id] else { return }
+            if let db, let full = await withCheckedContinuation({ c in
+                db.queue.async { c.resume(returning: db.fullMessage(msg)) } }) {
+                m = full  // the cache now also has the HTML version
+            }
             current = m
         } catch {
             pendingUnread[id] = nil
