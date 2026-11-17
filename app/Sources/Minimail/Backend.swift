@@ -49,6 +49,41 @@ struct AccountInfo: Codable, Identifiable, Hashable {
     var id: String { name }
 }
 
+struct ProviderInfo: Codable, Identifiable, Hashable {
+    let key: String
+    let help: String
+    var id: String { key }
+    var label: String {
+        switch key {
+        case "gmail": "Gmail / Google Workspace"
+        case "icloud": "iCloud"
+        case "yahoo": "Yahoo"
+        case "outlook": "Outlook / Microsoft 365"
+        case "ovh": "OVH"
+        case "ox-numerique": "OX (numerique.gouv.fr)"
+        case "proton-bridge": "Proton Mail (via Bridge)"
+        case "custom": "Other IMAP server"
+        default: key
+        }
+    }
+}
+
+struct LoginResult: Codable {
+    let name: String
+    let ok: Bool
+    let error: String?
+}
+
+struct DetectResult: Codable {
+    let provider: String
+}
+
+struct NotifStatus: Codable {
+    let installed: Bool
+    let running: Bool
+    let notifier: Bool
+}
+
 struct CLIError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -72,7 +107,8 @@ enum CLI {
                 p.executableURL = URL(fileURLWithPath: path)
                 p.arguments = args
                 var env = ProcessInfo.processInfo.environment
-                env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+                let home = FileManager.default.homeDirectoryForCurrentUser.path
+                env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
                 env["PYTHONIOENCODING"] = "utf-8"
                 p.environment = env
                 let out = Pipe(), err = Pipe(), inp = Pipe()

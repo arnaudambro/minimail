@@ -45,6 +45,9 @@ final class Store: ObservableObject {
     @Published var banner: String?
     @Published var inboxUnread: [String: Int] = [:]
     @Published var compose: Draft?
+    @Published var showAddAccount = false
+    @Published var providers: [ProviderInfo] = []
+    @Published var notif: NotifStatus?
 
     private var generation = 0
     private var started = false
@@ -57,6 +60,9 @@ final class Store: ObservableObject {
         guard !started else { return }
         started = true
         await loadAccounts()
+        if accounts.isEmpty { showAddAccount = true }
+        Task { await loadProviders() }
+        Task { await loadNotif() }
         await reload()
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(90))
@@ -70,6 +76,95 @@ final class Store: ObservableObject {
         } catch {
             banner = error.localizedDescription
         }
+    }
+
+    func loadProviders() async {
+        if let p = try? await CLI.json([ProviderInfo].self, ["providers", "--json"]) { providers = p }
+    }
+
+    func detectProvider(_ email: String) async -> String? {
+        try? await CLI.json(DetectResult.self, ["detect", email, "--json"]).provider
+    }
+
+    /// Returns nil on success, or an error message.
+    func addAccount(name: String, email: String, provider: String, username: String, displayName: String,
+                    password: String, imapHost: String, smtpHost: String) async -> String? {
+        var args = ["account", "add", name, email, "--provider", provider, "--password-stdin", "--json"]
+        if !username.isEmpty { args += ["--username", username] }
+        if !displayName.isEmpty { args += ["--display-name", displayName] }
+        if provider == "custom" { args += ["--imap-host", imapHost, "--smtp-host", smtpHost] }
+        do {
+            let r = try await CLI.json(LoginResult.self, args, input: password + "\n")
+            guard r.ok else { return friendly(r.error, provider: provider) }
+            await loadAccounts()
+            await reload()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    func changePassword(_ name: String, _ password: String) async -> String? {
+        do {
+            let r = try await CLI.json(LoginResult.self, ["account", "password", name, "--password-stdin", "--json"], input: password + "\n")
+            if r.ok { await reload() }
+            return r.ok ? nil : friendly(r.error, provider: accounts.first { $0.name == name }?.provider ?? "")
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    func removeAccount(_ name: String) async {
+        await perform { _ = try await CLI.run(["account", "remove", name, "--json"]) }
+        if account == name { account = nil }
+        await loadAccounts()
+        await reload()
+    }
+
+    private func friendly(_ error: String?, provider: String) -> String {
+        let e = error ?? "Login failed."
+        let auth = e.localizedCaseInsensitiveContains("authenticat") || e.localizedCaseInsensitiveContains("credentials")
+            || e.localizedCaseInsensitiveContains("login")
+        guard auth else { return e }
+        switch provider {
+        case "gmail", "icloud", "yahoo":
+            return "The server refused the password. This provider needs an app password, not your normal password.\n(\(e))"
+        case "proton-bridge":
+            return "The Bridge refused the password. Use the password shown in the Proton Mail Bridge app.\n(\(e))"
+        default:
+            return "The server refused the username or password.\n(\(e))"
+        }
+    }
+
+    func loadNotif() async {
+        notif = try? await CLI.json(NotifStatus.self, ["daemon", "status", "--json"])
+    }
+
+    func setNotifications(_ on: Bool) async {
+        await perform { _ = try await CLI.run(["daemon", on ? "install" : "uninstall"]) }
+        try? await Task.sleep(for: .milliseconds(500))
+        await loadNotif()
+    }
+
+    func installNotifier() async {
+        let brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first { FileManager.default.isExecutableFile(atPath: $0) }
+        guard let brew else {
+            banner = "Homebrew is not installed. Install terminal-notifier manually."
+            return
+        }
+        busy = true
+        defer { busy = false }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: brew)
+                p.arguments = ["install", "terminal-notifier"]
+                try? p.run()
+                p.waitUntilExit()
+                c.resume()
+            }
+        }
+        await loadNotif()
     }
 
     func reload(silent: Bool = false) async {

@@ -12,9 +12,13 @@ struct MinimailApp: App {
                 .frame(minWidth: 860, minHeight: 500)
                 .task { await store.start() }
         }
+        Settings {
+            SettingsView().environmentObject(store)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Message") { store.newMessage() }.keyboardShortcut("n")
+                Button("Add Account…") { store.showAddAccount = true }
             }
             CommandMenu("Message") {
                 Button("Reply") { store.reply() }.keyboardShortcut("r").disabled(store.current == nil)
@@ -49,6 +53,9 @@ struct ContentView: View {
         .sheet(item: $store.compose) { draft in
             ComposeView(draft: draft).environmentObject(store)
         }
+        .sheet(isPresented: $store.showAddAccount) {
+            AddAccountView().environmentObject(store)
+        }
     }
 }
 
@@ -74,6 +81,7 @@ struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) { SidebarFooter() }
     }
 
     private var inboxBadge: Int {
@@ -96,6 +104,34 @@ struct Sidebar: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { store.account = name }
+    }
+}
+
+struct SidebarFooter: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button { store.showAddAccount = true } label: { Image(systemName: "plus") }
+                .help("Add an account")
+            Button {
+                Task { await store.setNotifications(!(store.notif?.installed ?? false)) }
+            } label: {
+                Image(systemName: store.notif?.installed == true ? "bell.fill" : "bell.slash")
+                    .foregroundStyle(store.notif?.installed == true ? Color.accentColor : .secondary)
+            }
+            .help(store.notif?.installed == true
+                  ? "Notifications are on. Click to turn them off."
+                  : "Notifications are off. Click to get a notification for new mail.")
+            .disabled(store.notif == nil || store.busy)
+            Spacer()
+            SettingsLink { Image(systemName: "gearshape") }
+                .help("Settings: accounts and notifications")
+        }
+        .buttonStyle(.borderless)
+        .font(.system(size: 14))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 }
 
@@ -124,7 +160,15 @@ struct MessageList: View {
         .listStyle(.inset)
         .onChange(of: store.selection) { store.selectionChanged() }
         .overlay {
-            if store.messages.isEmpty && !store.loading {
+            if store.accounts.isEmpty && !store.loading {
+                ContentUnavailableView {
+                    Label("Welcome to Minimail", systemImage: "envelope")
+                } description: {
+                    Text("Add your first email account to start.")
+                } actions: {
+                    Button("Add Account") { store.showAddAccount = true }.buttonStyle(.borderedProminent)
+                }
+            } else if store.messages.isEmpty && !store.loading {
                 ContentUnavailableView(store.unreadOnly ? "No Unread Mail" : "No Mail", systemImage: store.activeFolder.icon)
             }
         }

@@ -46,9 +46,20 @@ def cmd_account_add(a):
     )
     if not acct.imap_host or not acct.smtp_host:
         raise SystemExit("custom provider needs --imap-host and --smtp-host")
-    print(p["help"], file=sys.stderr)
+    if not a.json:
+        print(p["help"], file=sys.stderr)
     password = sys.stdin.readline().rstrip("\n") if a.password_stdin else getpass.getpass(f"Password for {acct.email}: ")
     keychain_set(acct.name, _clean(acct, password))
+    if a.json:
+        # Used by the app: only save the account when the login works.
+        ok, err = _check(acct)
+        if ok:
+            accts.append(acct)
+            save_accounts(accts)
+        else:
+            keychain_delete(acct.name)
+            imap.forget_folders(acct.name)
+        return out_json({"name": acct.name, "ok": ok, "error": err})
     accts.append(acct)
     save_accounts(accts)
     if a.no_test or _test(acct):
@@ -62,15 +73,23 @@ def _clean(acct: Account, password: str) -> str:
     return password.replace(" ", "") if acct.provider == "gmail" else password
 
 
-def _test(acct: Account) -> bool:
+def _check(acct: Account):
+    """Log in and find the folders. Returns (ok, error_message_or_folders)."""
     try:
         with imap.session(acct) as m:
             found = {k: imap.resolve_folder(m, acct, k) for k in imap.FOLDER_KEYS}
-        print(f"✓ {acct.name}: IMAP ok — " + ", ".join(f"{k}={imap.utf7_decode(v)}" for k, v in found.items()))
-        return True
+        return True, ", ".join(f"{k}={imap.utf7_decode(v)}" for k, v in found.items())
     except Exception as e:  # noqa: BLE001
-        print(f"✗ {acct.name}: {type(e).__name__}: {e}")
-        return False
+        msg = str(e)
+        if isinstance(getattr(e, "args", [None])[0], bytes):
+            msg = e.args[0].decode("utf-8", "replace")
+        return False, msg
+
+
+def _test(acct: Account) -> bool:
+    ok, info = _check(acct)
+    print(f"✓ {acct.name}: IMAP ok — {info}" if ok else f"✗ {acct.name}: {info}")
+    return ok
 
 
 def cmd_account_test(a):
@@ -98,13 +117,16 @@ def cmd_account_remove(a):
     save_accounts(left)
     keychain_delete(a.name)
     imap.forget_folders(a.name)
-    print(f"Removed {a.name}.")
+    print(json.dumps({"removed": a.name}) if a.json else f"Removed {a.name}.")
 
 
 def cmd_account_password(a):
     acct = get_account(a.name)
     password = sys.stdin.readline().rstrip("\n") if a.password_stdin else getpass.getpass(f"New password for {a.name}: ")
     keychain_set(a.name, _clean(acct, password))
+    if a.json:
+        ok, err = _check(acct)
+        return out_json({"name": a.name, "ok": ok, "error": None if ok else err})
     print("Saved in Keychain.")
     _test(acct)
 
@@ -138,6 +160,8 @@ def cmd_account_folders(a):
 
 
 def cmd_providers(a):
+    if a.json:
+        return out_json([{"key": k, "help": p["help"], "imap": p["imap"], "smtp": p["smtp"]} for k, p in PROVIDERS.items()])
     for k, p in PROVIDERS.items():
         print(f"{k:<14} {p['help']}")
 
@@ -230,8 +254,52 @@ def cmd_watch(a):
     Watcher(a.interval).run()
 
 
+MX_HINTS = [
+    ("google.com", "gmail"), ("googlemail.com", "gmail"),
+    ("icloud.com", "icloud"), ("me.com", "icloud"),
+    ("yahoodns.net", "yahoo"),
+    ("outlook.com", "outlook"),
+    ("ovh.net", "ovh"),
+    ("protonmail.ch", "proton-bridge"),
+    ("numerique.gouv.fr", "ox-numerique"),
+]
+DOMAIN_HINTS = {"gmail.com": "gmail", "googlemail.com": "gmail", "icloud.com": "icloud", "me.com": "icloud",
+                "mac.com": "icloud", "proton.me": "proton-bridge", "protonmail.com": "proton-bridge", "pm.me": "proton-bridge",
+                "outlook.com": "outlook", "hotmail.com": "outlook", "live.com": "outlook"}
+
+
+def detect_provider(email: str) -> tuple[str, list[str]]:
+    import subprocess
+    domain = email.rsplit("@", 1)[-1].strip().lower()
+    if domain.startswith("yahoo."):
+        return "yahoo", []
+    if domain in DOMAIN_HINTS:
+        return DOMAIN_HINTS[domain], []
+    try:
+        r = subprocess.run(["dig", "+short", "MX", domain], capture_output=True, text=True, timeout=5)
+        mx = [line.split()[-1].rstrip(".").lower() for line in r.stdout.splitlines() if line.strip()]
+    except Exception:  # noqa: BLE001
+        mx = []
+    for host in mx:
+        for hint, prov in MX_HINTS:
+            if host == hint or host.endswith("." + hint):
+                return prov, mx
+    return "custom", mx
+
+
+def cmd_detect(a):
+    prov, mx = detect_provider(a.email)
+    if a.json:
+        return out_json({"provider": prov, "mx": mx})
+    print(prov)
+
+
 def cmd_daemon(a):
     from . import watch
+    if a.action == "status" and a.json:
+        st = watch.agent_status()
+        return out_json({"installed": watch.PLIST.exists(), "running": st.startswith("state = running"),
+                         "state": st, "notifier": bool(core.notifier())})
     if a.action == "install":
         if not core.notifier():
             print("warning: terminal-notifier not found. Install it: brew install terminal-notifier", file=sys.stderr)
@@ -283,12 +351,14 @@ def build_parser():
     s.add_argument("--smtp-security", choices=["ssl", "starttls"])
     s.add_argument("--password-stdin", action="store_true")
     s.add_argument("--no-test", action="store_true")
+    s.add_argument("--json", action="store_true", help="test the login first; save only if it works")
     s.set_defaults(fn=cmd_account_add)
     s = j(acc.add_parser("list")); s.set_defaults(fn=cmd_account_list)
     s = acc.add_parser("test"); s.add_argument("names", nargs="*"); s.set_defaults(fn=cmd_account_test)
-    s = acc.add_parser("remove"); s.add_argument("name"); s.set_defaults(fn=cmd_account_remove)
+    s = j(acc.add_parser("remove")); s.add_argument("name"); s.set_defaults(fn=cmd_account_remove)
     s = acc.add_parser("password", help="change the stored password")
-    s.add_argument("name"); s.add_argument("--password-stdin", action="store_true"); s.set_defaults(fn=cmd_account_password)
+    s.add_argument("name"); s.add_argument("--password-stdin", action="store_true"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_account_password)
     s = acc.add_parser("enable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, True))
     s = acc.add_parser("disable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, False))
     s = acc.add_parser("folder", help="override the server folder used for sent/spam")
@@ -296,7 +366,9 @@ def build_parser():
     s.set_defaults(fn=cmd_account_folder)
     s = acc.add_parser("folders", help="list the server's folders"); s.add_argument("name"); s.set_defaults(fn=cmd_account_folders)
 
-    sub.add_parser("providers", help="list provider presets").set_defaults(fn=cmd_providers)
+    j(sub.add_parser("providers", help="list provider presets")).set_defaults(fn=cmd_providers)
+    s = j(sub.add_parser("detect", help="guess the provider of an email address (MX lookup)"))
+    s.add_argument("email"); s.set_defaults(fn=cmd_detect)
 
     s = j(sub.add_parser("list", help="list latest messages, newest first"))
     s.add_argument("--folder", "-f", **folder_kw)
@@ -336,7 +408,7 @@ def build_parser():
 
     s = sub.add_parser("watch", help="poll inboxes and post notifications (foreground)")
     s.add_argument("--interval", type=int, default=60); s.set_defaults(fn=cmd_watch)
-    s = sub.add_parser("daemon", help="run the watcher at login via launchd")
+    s = j(sub.add_parser("daemon", help="run the watcher at login via launchd"))
     s.add_argument("action", choices=["install", "uninstall", "status"])
     s.add_argument("--interval", type=int, default=60); s.set_defaults(fn=cmd_daemon)
 
