@@ -21,6 +21,18 @@ struct MinimailApp: App {
                 Button("New Message") { store.newMessage() }.keyboardShortcut("n")
                 Button("Add Account…") { store.showAddAccount = true }
             }
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") {
+                    // In a text field: undo typing. Elsewhere: undo the last delete / spam.
+                    if NSApp.keyWindow?.firstResponder is NSText || NSApp.keyWindow?.sheetParent != nil {
+                        NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
+                    } else {
+                        Task { await store.undo() }
+                    }
+                }.keyboardShortcut("z")
+                Button("Redo") { NSApp.sendAction(Selector(("redo:")), to: nil, from: nil) }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+            }
             CommandGroup(replacing: .pasteboard) {
                 Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }.keyboardShortcut("x")
                 Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }.keyboardShortcut("c")
@@ -290,6 +302,22 @@ struct StatusBar: View {
     @EnvironmentObject var store: Store
 
     var body: some View {
+        if let u = store.undoMessage {
+            HStack {
+                Text(u)
+                Spacer()
+                if u != "Restoring…" {
+                    Button("Undo") { Task { await store.undo() } }
+                        .help("Undo (⌘Z)")
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .font(.callout)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.bar)
+        }
         if store.banner != nil || !store.errors.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
                 if let b = store.banner {

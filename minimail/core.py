@@ -22,7 +22,7 @@ from email.utils import formataddr, formatdate, getaddresses, make_msgid, parsea
 import json
 
 from . import imap, store
-from .config import Account, get_account, load_accounts
+from .config import STATE_DIR, Account, get_account, load_accounts
 
 HEADER_ITEMS = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)])"
 
@@ -36,7 +36,7 @@ def make_id(account: str, folder: str, uid: int) -> str:
 def parse_id(mid: str) -> tuple[str, str, int]:
     try:
         account, folder, uid = mid.rsplit(":", 2)
-        if folder not in imap.FOLDER_KEYS:
+        if folder not in imap.FOLDER_KEYS + ("trash",):
             raise ValueError
         return account, folder, int(uid)
     except ValueError:
@@ -406,12 +406,27 @@ def mark_all_read(folder="inbox", accounts=None):
     return results, errors
 
 
-def move(ids, dest: str) -> int:
-    """Move messages to inbox/spam (or sent). Uses MOVE when available."""
+UNDO_FILE = STATE_DIR / "undo.json"
+
+
+def _remember(entries: list[dict]) -> None:
+    """Keep the last move so `undo` can put the messages back."""
+    try:
+        UNDO_FILE.write_text(json.dumps({"ts": time.time(), "moves": entries}))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def move(ids, dest: str, remember: bool = True) -> int:
+    """Move messages to inbox/spam/trash. Uses MOVE when available."""
     n = 0
+    undo = []
     for (account, folder), uids in group_ids(ids).items():
         if folder == dest:
             continue
+        db = store.connect()
+        msgids = [r["message_id"] for u in uids if (r := store.get(db, account, folder, u)) is not None and r["message_id"]]
+        undo.append({"account": account, "src": folder, "dest": dest, "message_ids": msgids})
         acct = get_account(account)
         with imap.session(acct) as m:
             target = imap.resolve_folder(m, acct, dest)
@@ -434,7 +449,37 @@ def move(ids, dest: str) -> int:
                 n += len(part)
         store.remove(store.connect(), account, folder, uids)
     clear_notifications(ids)
+    if remember and undo:
+        _remember(undo)
     return n
+
+
+def undo() -> dict:
+    """Put the messages of the last delete / spam / not-spam back where they were."""
+    try:
+        data = json.loads(UNDO_FILE.read_text())
+    except Exception:  # noqa: BLE001
+        return {"restored": 0, "error": "Nothing to undo."}
+    restored, missing = 0, 0
+    for e in data.get("moves", []):
+        acct = get_account(e["account"])
+        with imap.session(acct) as m:
+            imap.select(m, acct, e["dest"], readonly=True)
+            uids = []
+            for mid in e["message_ids"]:
+                found = imap.search_uids(m, "HEADER", "Message-ID", imap.quote(mid))
+                if found:
+                    uids.append(found[-1])
+                else:
+                    missing += 1
+        if uids:
+            restored += move([make_id(e["account"], e["dest"], u) for u in uids], e["src"], remember=False)
+        try:
+            store.sync_account(acct, (e["src"],))
+        except Exception:  # noqa: BLE001
+            pass
+    UNDO_FILE.unlink(missing_ok=True)
+    return {"restored": restored, "missing": missing}
 
 
 def delete(ids) -> int:
@@ -450,6 +495,7 @@ def delete(ids) -> int:
         if trash:
             n += move([make_id(account, folder, u) for u in uids], "trash")
             continue
+        UNDO_FILE.unlink(missing_ok=True)  # deleted for good: nothing to undo
         with imap.session(acct) as m:
             imap.select(m, acct, folder, readonly=False)
             caps = {c.upper() for c in (m.capabilities or ())}

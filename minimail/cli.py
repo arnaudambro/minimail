@@ -251,6 +251,16 @@ def cmd_delete(a):
     print(json.dumps({"deleted": n}) if a.json else f"Moved {n} to Trash.")
 
 
+def cmd_undo(a):
+    r = core.undo()
+    if a.json:
+        print(json.dumps(r))
+    elif r.get("error"):
+        print(r["error"])
+    else:
+        print(f"Restored {r['restored']} message(s)." + (f" {r['missing']} not found." if r["missing"] else ""))
+
+
 def cmd_sync(a):
     from . import store
     accts = core.pick_accounts(a.account)
@@ -468,6 +478,8 @@ def build_parser():
 
     s = j(sub.add_parser("delete", help="move messages to Trash")); s.add_argument("ids", nargs="+")
     s.set_defaults(fn=cmd_delete)
+    s = j(sub.add_parser("undo", help="undo the last delete / spam / not-spam"))
+    s.set_defaults(fn=cmd_undo)
 
     s = j(sub.add_parser("unsubscribe", help="unsubscribe from a mailing list (List-Unsubscribe)"))
     s.add_argument("id"); s.set_defaults(fn=cmd_unsubscribe)

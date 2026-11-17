@@ -36,6 +36,7 @@ minimail spam ID [ID...]                       # move to spam
 minimail not-spam ID [ID...]                   # move back to inbox
 minimail delete ID [ID...]                     # move to Trash
 minimail unsubscribe ID                        # leave a mailing list
+minimail undo                                  # undo the last delete / spam / not-spam
 ```
 
 ## Send

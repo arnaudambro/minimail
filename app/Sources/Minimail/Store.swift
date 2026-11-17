@@ -49,6 +49,9 @@ final class Store: ObservableObject {
     @Published var busy = false
     @Published var errors: [String: String] = [:]
     @Published var banner: String?
+    /// "Moved 2 emails to Trash." after a delete / spam, with an Undo button (⌘Z).
+    @Published var undoMessage: String?
+    private var undoToken = 0
     /// Unread counts per account and folder: unread["gmail"]["inbox"].
     @Published var unread: [String: [String: Int]] = [:]
     /// Bumped on every optimistic change, so a slower server count cannot overwrite it.
@@ -433,6 +436,15 @@ final class Store: ObservableObject {
         current = nil
         do {
             _ = try await CLI.run([command, "--json"] + ids)
+            let what = ids.count == 1 ? "1 email" : "\(ids.count) emails"
+            let place = command == "delete" ? "Trash" : command == "spam" ? "Spam" : "Inbox"
+            undoMessage = "Moved \(what) to \(place)."
+            undoToken += 1
+            let token = undoToken
+            Task {
+                try? await Task.sleep(for: .seconds(15))
+                if undoToken == token { undoMessage = nil }
+            }
         } catch {
             messages = (messages + removed).sorted { $0.ts > $1.ts }
             unread = savedCounts
@@ -442,6 +454,23 @@ final class Store: ObservableObject {
         inFlight -= 1
         pendingRemoved.subtract(set)
         await refreshCounts()
+    }
+
+    var canUndo: Bool { undoMessage != nil }
+
+    func undo() async {
+        guard undoMessage != nil else { return }
+        undoMessage = "Restoring…"
+        undoToken += 1
+        do {
+            _ = try await CLI.run(["undo", "--json"])
+            undoMessage = nil
+            await reload()
+            await refreshCounts()
+        } catch {
+            undoMessage = nil
+            banner = error.localizedDescription
+        }
     }
 
     private func updateBadge() {
