@@ -18,6 +18,8 @@ struct Draft: Identifiable {
     let id = UUID()
     var account = ""
     var to = ""
+    var cc = ""
+    var bcc = ""
     var subject = ""
     var body = ""
     var replyTo: String?
@@ -519,6 +521,12 @@ final class Store: ObservableObject {
         for addr in d.to.split(separator: ",") {
             let t = addr.trimmingCharacters(in: .whitespaces)
             if !t.isEmpty { args += ["--to", t] }
+        }
+        for (flag, list) in [("--cc", d.cc), ("--bcc", d.bcc)] {
+            for addr in list.split(separator: ",") {
+                let t = addr.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { args += [flag, t] }
+            }
         }
         if let r = d.replyTo { args += ["--reply", r] }
         if let f = d.forwardOf { args += ["--forward", f] }

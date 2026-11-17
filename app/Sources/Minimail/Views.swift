@@ -501,14 +501,30 @@ struct ComposeView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Form {
-                Picker("From", selection: $draft.account) {
-                    ForEach(store.accounts) { a in Text(a.email).tag(a.name) }
+            VStack(spacing: 8) {
+                row("From") {
+                    Picker("", selection: $draft.account) {
+                        ForEach(store.accounts) { a in Text(a.email).tag(a.name) }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    Spacer()
+                    if !showCcBcc {
+                        Button("Cc / Bcc") { showCcBcc = true }
+                            .buttonStyle(.link)
+                            .help("Add Cc and Bcc fields")
+                    }
                 }
-                AddressField(text: $draft.to)
-                TextField("Subject", text: $draft.subject)
+                .zIndex(1)
+                row("To") { AddressField(placeholder: "name@example.com, …", text: $draft.to) }.zIndex(5)
+                if showCcBcc {
+                    row("Cc") { AddressField(placeholder: "Copy to", text: $draft.cc) }.zIndex(4)
+                    row("Bcc") { AddressField(placeholder: "Hidden copy to", text: $draft.bcc) }.zIndex(3)
+                }
+                row("Subject") { TextField("", text: $draft.subject).textFieldStyle(.roundedBorder) }.zIndex(2)
             }
             .padding()
+            .zIndex(1)
             TextEditor(text: $draft.body)
                 .font(.body)
                 .scrollContentBackground(.hidden)
@@ -541,6 +557,15 @@ struct ComposeView: View {
         .frame(width: 620, height: 520)
     }
 
+    @State private var showCcBcc = false
+
+    private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
+            content()
+        }
+    }
+
     private func send() async {
         sending = true
         defer { sending = false }
@@ -559,7 +584,6 @@ struct ComposeView: View {
 /// "To" field that suggests addresses found in your mail (people you write to come first).
 struct AddressField: View {
     @EnvironmentObject var store: Store
-    @Binding var text: String
     @State private var suggestions: [Contact] = []
     @State private var highlighted = 0
     @FocusState private var focused: Bool
@@ -568,10 +592,15 @@ struct AddressField: View {
         String(text.split(separator: ",", omittingEmptySubsequences: false).last ?? "").trimmingCharacters(in: .whitespaces)
     }
 
+    var placeholder = ""
+    @Binding var text: String
+
     var body: some View {
-        TextField("To", text: $text, prompt: Text("name@example.com, …"))
+        TextField("", text: $text, prompt: Text(placeholder))
+            .textFieldStyle(.roundedBorder)
             .focused($focused)
             .onChange(of: text) { refresh() }
+            .onChange(of: focused) { if !focused { suggestions = [] } }
             .onKeyPress(.downArrow) { move(1) }
             .onKeyPress(.upArrow) { move(-1) }
             .onKeyPress(.tab) { pick() }
@@ -581,20 +610,35 @@ struct AddressField: View {
                 suggestions = []
                 return .handled
             }
-        if focused {
-            ForEach(Array(suggestions.enumerated()), id: \.element) { i, c in
-                HStack {
-                    Text(c.name.isEmpty ? c.email : c.name).lineLimit(1)
-                    if !c.name.isEmpty { Text(c.email).foregroundStyle(.secondary).lineLimit(1) }
-                    Spacer()
+            // Floats over the fields below instead of pushing them down.
+            .overlay(alignment: .topLeading) {
+                if focused && !suggestions.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(suggestions.enumerated()), id: \.element) { i, c in
+                            HStack {
+                                Text(c.name.isEmpty ? c.email : c.name).lineLimit(1)
+                                    .foregroundStyle(i == highlighted ? Color.white : Color.primary)
+                                if !c.name.isEmpty {
+                                    Text(c.email).lineLimit(1)
+                                        .foregroundStyle(i == highlighted ? Color.white.opacity(0.85) : Color.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                            .padding(.horizontal, 8)
+                            .background(i == highlighted ? Color.accentColor : .clear, in: RoundedRectangle(cornerRadius: 5))
+                            .contentShape(Rectangle())
+                            .onTapGesture { choose(c) }
+                            .onHover { if $0 { highlighted = i } }
+                        }
+                    }
+                    .padding(4)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
+                    .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+                    .offset(y: 26)
                 }
-                .padding(.vertical, 2)
-                .padding(.horizontal, 6)
-                .background(i == highlighted ? Color.accentColor.opacity(0.2) : .clear, in: RoundedRectangle(cornerRadius: 5))
-                .contentShape(Rectangle())
-                .onTapGesture { choose(c) }
             }
-        }
     }
 
     private func refresh() {
