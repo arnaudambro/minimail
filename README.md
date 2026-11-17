@@ -2,6 +2,7 @@
 
 A minimal IMAP mail client for macOS. Three folders, nothing else: **Inbox, Sent, Spam**.
 
+- A native macOS app (SwiftUI) **and** a terminal UI
 - Native macOS notifications for new mail — **click a notification to mark the message as read**
 - Terminal UI: select all, mark read, move to spam, read a message
 - A scriptable CLI with `--json` output, built so AI agents like [Claude Code](https://claude.com/claude-code) can triage your mail
@@ -15,6 +16,16 @@ A minimal IMAP mail client for macOS. Three folders, nothing else: **Inbox, Sent
 brew install terminal-notifier          # for notifications
 uv tool install git+https://github.com/arnaudambro/minimail   # or: pipx install . / uv tool install .
 ```
+
+### macOS app
+
+```bash
+git clone https://github.com/arnaudambro/minimail && cd minimail
+app/build.sh                            # builds and installs ~/Applications/Minimail.app (needs Xcode)
+```
+
+The app is a thin UI on top of the `minimail` CLI, so install the CLI first.
+Shortcuts: ⌘A select all · ⇧⌘U mark read · ⌥⌘U mark unread · ⇧⌘K mark all read · ⇧⌘J spam / not spam · ⌘N new · ⌘R reply · ⇧⌘N refresh.
 
 ## Add accounts
 

@@ -1,0 +1,200 @@
+import AppKit
+import SwiftUI
+
+enum Folder: String, CaseIterable, Identifiable, Hashable {
+    case inbox, sent, spam
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var icon: String {
+        switch self {
+        case .inbox: "tray"
+        case .sent: "paperplane"
+        case .spam: "xmark.bin"
+        }
+    }
+}
+
+struct Draft: Identifiable {
+    let id = UUID()
+    var account = ""
+    var to = ""
+    var subject = ""
+    var body = ""
+    var replyTo: String?
+}
+
+@MainActor
+final class Store: ObservableObject {
+    @Published var folder: Folder? = .inbox {
+        didSet { if oldValue != folder { selection = []; Task { await reload() } } }
+    }
+    @Published var account: String? {
+        didSet { if oldValue != account { selection = []; Task { await reload() } } }
+    }
+    @Published var unreadOnly = false {
+        didSet { if oldValue != unreadOnly { Task { await reload() } } }
+    }
+    @Published var accounts: [AccountInfo] = []
+    @Published var messages: [Message] = []
+    @Published var selection = Set<String>()
+    @Published var current: FullMessage?
+    @Published var loading = false
+    @Published var loadingMessage = false
+    @Published var busy = false
+    @Published var errors: [String: String] = [:]
+    @Published var banner: String?
+    @Published var inboxUnread: [String: Int] = [:]
+    @Published var compose: Draft?
+
+    private var generation = 0
+    private var started = false
+
+    var activeFolder: Folder { folder ?? .inbox }
+    var unreadCount: Int { messages.lazy.filter(\.unread).count }
+    var targets: [String] { selection.isEmpty ? (current.map { [$0.id] } ?? []) : Array(selection) }
+
+    func start() async {
+        guard !started else { return }
+        started = true
+        await loadAccounts()
+        await reload()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(90))
+            await reload(silent: true)
+        }
+    }
+
+    func loadAccounts() async {
+        do {
+            accounts = try await CLI.json([AccountInfo].self, ["account", "list", "--json"]).filter(\.enabled)
+        } catch {
+            banner = error.localizedDescription
+        }
+    }
+
+    func reload(silent: Bool = false) async {
+        generation += 1
+        let gen = generation
+        if !silent { loading = true }
+        var args = ["list", "--json", "-f", activeFolder.rawValue, "-n", "40"]
+        if let account { args += ["-a", account] }
+        if unreadOnly { args.append("--unread") }
+        do {
+            let r = try await CLI.json(ListResponse.self, args)
+            guard gen == generation else { return }
+            messages = r.messages
+            errors = r.errors
+            selection = selection.intersection(Set(r.messages.map(\.id)))
+            if !silent { banner = nil }
+        } catch {
+            guard gen == generation else { return }
+            banner = error.localizedDescription
+        }
+        loading = false
+        await refreshCounts()
+    }
+
+    func refreshCounts() async {
+        guard let data = try? await CLI.run(["counts", "--json"]),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accts = obj["accounts"] as? [String: Any] else { return }
+        var counts: [String: Int] = [:]
+        for (name, v) in accts {
+            if let inbox = (v as? [String: Any])?["inbox"] as? [String: Any], let n = inbox["unread"] as? Int {
+                counts[name] = n
+            }
+        }
+        inboxUnread = counts
+        let total = counts.values.reduce(0, +)
+        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+    }
+
+    func selectionChanged() {
+        if selection.count == 1, let id = selection.first {
+            if current?.id != id { Task { await open(id) } }
+        } else {
+            current = nil
+        }
+    }
+
+    func open(_ id: String) async {
+        loadingMessage = true
+        defer { loadingMessage = false }
+        let wasUnread = messages.first { $0.id == id }?.unread ?? false
+        var args = ["show", id, "--json"]
+        if wasUnread { args.append("--mark-read") }
+        do {
+            let m = try await CLI.json(FullMessage.self, args)
+            guard selection == [id] else { return }
+            current = m
+            if wasUnread { setLocal([id], unread: false) }
+        } catch {
+            banner = error.localizedDescription
+        }
+    }
+
+    private func setLocal(_ ids: [String], unread: Bool) {
+        let set = Set(ids)
+        for i in messages.indices where set.contains(messages[i].id) {
+            if messages[i].unread != unread, messages[i].folder == "inbox" {
+                inboxUnread[messages[i].account, default: 0] += unread ? 1 : -1
+            }
+            messages[i].unread = unread
+        }
+        let total = inboxUnread.values.reduce(0, +)
+        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+    }
+
+    func setRead(_ read: Bool) async {
+        let ids = targets.filter { id in messages.first { $0.id == id }?.unread == read }
+        guard !ids.isEmpty else { return }
+        await perform { _ = try await CLI.run([read ? "mark-read" : "mark-unread", "--json"] + ids) }
+        setLocal(ids, unread: !read)
+    }
+
+    func markAllRead() async {
+        var args = ["mark-read", "--all", "--json", "-f", activeFolder.rawValue]
+        if let account { args += ["-a", account] }
+        await perform { _ = try await CLI.run(args) }
+        setLocal(messages.map(\.id), unread: false)
+        await refreshCounts()
+    }
+
+    func toggleSpam() async {
+        guard activeFolder != .sent else { return }
+        let ids = targets
+        guard !ids.isEmpty else { return }
+        await perform { _ = try await CLI.run([self.activeFolder == .spam ? "not-spam" : "spam", "--json"] + ids) }
+        let set = Set(ids)
+        messages.removeAll { set.contains($0.id) }
+        selection = []
+        current = nil
+        await refreshCounts()
+    }
+
+    func newMessage() {
+        compose = Draft(account: account ?? accounts.first?.name ?? "")
+    }
+
+    func reply() {
+        guard let m = current else { return }
+        let subject = m.subject.lowercased().hasPrefix("re:") ? m.subject : "Re: \(m.subject)"
+        compose = Draft(account: m.account, to: m.reply_to.isEmpty ? m.from : m.reply_to, subject: subject, replyTo: m.id)
+    }
+
+    func send(_ d: Draft) async throws {
+        var args = ["send", "--json", "-a", d.account, "--subject", d.subject]
+        for addr in d.to.split(separator: ",") {
+            let t = addr.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty { args += ["--to", t] }
+        }
+        if let r = d.replyTo { args += ["--reply", r] }
+        _ = try await CLI.run(args, input: d.body)
+    }
+
+    private func perform(_ work: @escaping () async throws -> Void) async {
+        busy = true
+        defer { busy = false }
+        do { try await work() } catch { banner = error.localizedDescription }
+    }
+}
