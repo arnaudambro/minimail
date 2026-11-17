@@ -153,7 +153,7 @@ struct AddAccountView: View {
             }
             .formStyle(.grouped)
             .scrollDisabled(true)
-            .frame(height: provider == "custom" ? 430 : 340)
+            .frame(height: provider == "custom" ? 400 : 300)
             if let error {
                 Text(error)
                     .font(.callout).foregroundStyle(.red)
