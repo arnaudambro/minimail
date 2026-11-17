@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimail"
+version = "0.1.0"
+description = "A minimal IMAP mail client for macOS: Inbox, Sent, Spam, notifications, and a CLI built for AI agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["email", "imap", "cli", "tui", "macos", "claude-code"]
+classifiers = ["Environment :: Console :: Curses", "Operating System :: MacOS", "Topic :: Communications :: Email :: Email Clients (MUA)"]
+
+[project.scripts]
+minimail = "minimail.cli:main"
+
+[tool.setuptools]
+packages = ["minimail"]
+
+[tool.setuptools.package-data]
+minimail = ["skill/SKILL.md"]
