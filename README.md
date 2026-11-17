@@ -13,7 +13,7 @@ A minimal IMAP mail client for macOS. Three folders, nothing else: **Inbox, Sent
 
 ```bash
 brew install terminal-notifier          # for notifications
-uv tool install git+https://github.com/<you>/minimail   # or: pipx install . / uv tool install .
+uv tool install git+https://github.com/arnaudambro/minimail   # or: pipx install . / uv tool install .
 ```
 
 ## Add accounts
