@@ -243,6 +243,11 @@ def cmd_move(a):
     print(json.dumps({"moved": n}) if a.json else f"Moved {n} to {a.dest}.")
 
 
+def cmd_delete(a):
+    n = core.delete(a.ids)
+    print(json.dumps({"deleted": n}) if a.json else f"Moved {n} to Trash.")
+
+
 def cmd_counts(a):
     results, errors = core.unread_counts(a.account)
     if a.json:
@@ -420,6 +425,9 @@ def build_parser():
     s.set_defaults(fn=cmd_move, dest="spam")
     s = j(sub.add_parser("not-spam", help="move messages back to inbox")); s.add_argument("ids", nargs="+")
     s.set_defaults(fn=cmd_move, dest="inbox")
+
+    s = j(sub.add_parser("delete", help="move messages to Trash")); s.add_argument("ids", nargs="+")
+    s.set_defaults(fn=cmd_delete)
 
     s = j(sub.add_parser("counts", help="unread/total per account and folder"))
     s.add_argument("--account", "-a", action="append"); s.set_defaults(fn=cmd_counts)

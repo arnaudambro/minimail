@@ -25,7 +25,7 @@ app/build.sh                            # builds and installs ~/Applications/Min
 ```
 
 The app is a thin UI on top of the `minimail` CLI, so install the CLI first.
-Shortcuts: ⌘A select all · ⇧⌘U mark read · ⌥⌘U mark unread · ⇧⌘K mark all read · ⇧⌘J spam / not spam · ⌘N new · ⌘R reply · ⇧⌘N refresh.
+Shortcuts: ⌘A select all · ⇧⌘U mark read · ⌥⌘U mark unread · ⇧⌘K mark all read · ⇧⌘J spam / not spam · ⌫ delete · ⌘N new · ⌘R reply · ⇧⌘N refresh.
 
 ## Add accounts
 
@@ -55,6 +55,7 @@ minimail list -f spam
 minimail show perso:inbox:4821
 minimail mark-read --all                # select all → read, every account
 minimail spam perso:inbox:4821
+minimail delete perso:inbox:4821        # move to Trash
 minimail send -a perso --to x@example.com --subject Hi --body "Hello"
 minimail send -a perso --reply perso:inbox:4821 --body "Thanks!"
 ```

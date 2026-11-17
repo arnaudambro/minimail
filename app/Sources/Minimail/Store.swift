@@ -295,18 +295,32 @@ final class Store: ObservableObject {
 
     func toggleSpam() async {
         guard activeFolder != .sent else { return }
+        await removeOptimistically(activeFolder == .spam ? "not-spam" : "spam")
+    }
+
+    func delete() async {
+        await removeOptimistically("delete")
+    }
+
+    /// Remove the targets from the list at once, then run the CLI command; put them back if it fails.
+    private func removeOptimistically(_ command: String) async {
         let ids = targets
         guard !ids.isEmpty else { return }
         let set = Set(ids)
         let removed = messages.filter { set.contains($0.id) }
+        let savedCounts = inboxUnread
+        for m in removed where m.unread && m.folder == "inbox" { inboxUnread[m.account, default: 1] -= 1 }
+        updateBadge()
         messages.removeAll { set.contains($0.id) }
         pendingRemoved.formUnion(set)
         selection = []
         current = nil
         do {
-            _ = try await CLI.run([activeFolder == .spam ? "not-spam" : "spam", "--json"] + ids)
+            _ = try await CLI.run([command, "--json"] + ids)
         } catch {
             messages = (messages + removed).sorted { $0.ts > $1.ts }
+            inboxUnread = savedCounts
+            updateBadge()
             banner = error.localizedDescription
         }
         pendingRemoved.subtract(set)

@@ -28,6 +28,8 @@ struct MinimailApp: App {
                 Button("Mark All as Read") { Task { await store.markAllRead() } }.keyboardShortcut("k", modifiers: [.command, .shift])
                 Button(store.activeFolder == .spam ? "Not Spam" : "Move to Spam") { Task { await store.toggleSpam() } }
                     .keyboardShortcut("j", modifiers: [.command, .shift])
+                Button("Delete") { Task { await store.delete() } }
+                    .keyboardShortcut(.delete, modifiers: .command)
                 Divider()
                 Button("Refresh") { Task { await store.reload() } }.keyboardShortcut("n", modifiers: [.command, .shift])
             }
@@ -155,9 +157,15 @@ struct MessageList: View {
                             Task { await store.toggleSpam() }
                         }
                     }
+                    Divider()
+                    Button("Delete", role: .destructive) {
+                        if !store.selection.contains(m.id) { store.selection = [m.id] }
+                        Task { await store.delete() }
+                    }
                 }
         }
         .listStyle(.inset)
+        .onDeleteCommand { Task { await store.delete() } }
         .onChange(of: store.selection) { store.selectionChanged() }
         .overlay {
             if store.accounts.isEmpty && !store.loading {
@@ -192,6 +200,9 @@ struct MessageList: View {
                     .help(store.activeFolder == .spam ? "Move back to Inbox (⇧⌘J)" : "Move to Spam (⇧⌘J)")
                     .disabled(store.targets.isEmpty)
                 }
+                Button { Task { await store.delete() } } label: { Label("Delete", systemImage: "trash") }
+                    .help("Move to Trash (⌫)")
+                    .disabled(store.targets.isEmpty)
                 Toggle(isOn: $store.unreadOnly) {
                     Label("Unread Only", systemImage: "line.3.horizontal.decrease.circle")
                 }
@@ -287,6 +298,7 @@ struct DetailView: View {
                         if store.activeFolder != .sent {
                             Button(store.activeFolder == .spam ? "Not Spam" : "Move to Spam") { Task { await store.toggleSpam() } }
                         }
+                        Button("Delete", role: .destructive) { Task { await store.delete() } }
                     }
                 }
             } else if let m = store.current {

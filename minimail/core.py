@@ -285,6 +285,34 @@ def move(ids, dest: str) -> int:
     return n
 
 
+def delete(ids) -> int:
+    """Move messages to the account's Trash. Without a Trash folder, delete them for good."""
+    n = 0
+    for (account, folder), uids in group_ids(ids).items():
+        acct = get_account(account)
+        with imap.session(acct) as m:
+            try:
+                trash = imap.resolve_folder(m, acct, "trash")
+            except RuntimeError:
+                trash = None
+        if trash:
+            n += move([make_id(account, folder, u) for u in uids], "trash")
+            continue
+        with imap.session(acct) as m:
+            imap.select(m, acct, folder, readonly=False)
+            caps = {c.upper() for c in (m.capabilities or ())}
+            for part in imap.chunks(uids):
+                s = imap.uidset(part)
+                m.uid("STORE", s, "+FLAGS.SILENT", "(\\Deleted)")
+                if "UIDPLUS" in caps:
+                    m.uid("EXPUNGE", s)
+                else:
+                    m.expunge()
+                n += len(part)
+    clear_notifications(ids)
+    return n
+
+
 def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: str | None = None) -> dict:
     acct = get_account(account)
     msg = EmailMessage()

@@ -17,9 +17,11 @@ _FALLBACKS = {
     "sent": ["Sent", "Sent Messages", "Sent Items", "Sent Mail", "INBOX.Sent", "[Gmail]/Sent Mail",
              "Envoy&AOk-s", "&AMk-l&AOk-ments envoy&AOk-s", "Messages envoy&AOk-s"],
     "spam": ["Junk", "Spam", "Bulk", "Junk E-mail", "Junk Email", "INBOX.Junk", "INBOX.spam", "INBOX.Spam",
-             "[Gmail]/Spam", "Courrier ind&AOk-sirable", "Ind&AOk-sirables"],
+             "[Gmail]/Spam", "Courrier ind&AOk-sirable", "Ind&AOk-sirables", "Pourriel"],
+    "trash": ["Trash", "Deleted Messages", "Deleted Items", "Deleted", "Bin", "INBOX.Trash", "[Gmail]/Trash",
+              "[Gmail]/Corbeille", "Corbeille", "&AMk-l&AOk-ments supprim&AOk-s", "Messages supprim&AOk-s"],
 }
-_SPECIAL_USE = {"sent": b"\\sent", "spam": b"\\junk"}
+_SPECIAL_USE = {"sent": b"\\sent", "spam": b"\\junk", "trash": b"\\trash"}
 _LIST_RE = re.compile(rb'\((?P<flags>[^)]*)\) (?P<delim>"(?:[^"\\]|\\.)*"|NIL) (?P<name>.+)$')
 _FOLDER_CACHE = STATE_DIR / "folders.json"
 
