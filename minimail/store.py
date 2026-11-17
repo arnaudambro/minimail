@@ -24,7 +24,8 @@ BODY_WINDOW = 400        # only prefetch bodies of the newest N messages per fol
 MAX_BODY_SIZE = 3_000_000
 
 HEADER_ITEMS = ("(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS "
-                "(FROM TO CC SUBJECT DATE MESSAGE-ID REPLY-TO REFERENCES)])")
+                "(FROM TO CC SUBJECT DATE MESSAGE-ID REPLY-TO REFERENCES LIST-UNSUBSCRIBE)])")
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS messages(
   account TEXT NOT NULL, folder TEXT NOT NULL, uid INTEGER NOT NULL,
   message_id TEXT, sender TEXT, recipients TEXT, cc TEXT, reply_to TEXT, refs TEXT,
   subject TEXT, ts REAL, unread INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0,
-  size INTEGER, body TEXT, attachments TEXT,
+  size INTEGER, body TEXT, attachments TEXT, list_unsub TEXT,
   UNIQUE(account, folder, uid));
 CREATE INDEX IF NOT EXISTS messages_folder_ts ON messages(folder, ts DESC);
 CREATE INDEX IF NOT EXISTS messages_account_folder_ts ON messages(account, folder, ts DESC);
@@ -73,8 +74,23 @@ def connect() -> sqlite3.Connection:
     if not _initialized:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        _migrate(db)
         _initialized = True
     return db
+
+
+def _migrate(db) -> None:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SCHEMA_VERSION:
+        return
+    cols = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    if "list_unsub" not in cols:
+        db.execute("ALTER TABLE messages ADD COLUMN list_unsub TEXT")
+    if version < 2:
+        # v2 keeps links in bodies: parse them again (prefetch refills them progressively).
+        db.execute("UPDATE messages SET body=NULL, attachments=NULL")
+    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    db.commit()
 
 
 # ---------------------------------------------------------------- reads
@@ -168,11 +184,12 @@ def remove(db, account: str, folder: str, uids) -> None:
     db.commit()
 
 
-def store_body(db, account: str, folder: str, uid: int, body: str, attachments: list, cc="", reply_to="", refs="") -> None:
+def store_body(db, account: str, folder: str, uid: int, body: str, attachments: list, cc="", reply_to="", refs="",
+               list_unsub="") -> None:
     db.execute("UPDATE messages SET body=?, attachments=?, cc=COALESCE(NULLIF(?, ''), cc), "
-               "reply_to=COALESCE(NULLIF(?, ''), reply_to), refs=COALESCE(NULLIF(?, ''), refs) "
-               "WHERE account=? AND folder=? AND uid=?",
-               (body, json.dumps(attachments), cc, reply_to, refs, account, folder, uid))
+               "reply_to=COALESCE(NULLIF(?, ''), reply_to), refs=COALESCE(NULLIF(?, ''), refs), "
+               "list_unsub=COALESCE(NULLIF(?, ''), list_unsub) WHERE account=? AND folder=? AND uid=?",
+               (body, json.dumps(attachments), cc, reply_to, refs, list_unsub, account, folder, uid))
     db.commit()
 
 
@@ -192,7 +209,7 @@ def _header_row(acct: Account, key: str, r: dict) -> tuple:
     get = lambda k: str(h.get(k, "") or "")  # noqa: E731
     return (acct.name, key, r["uid"], get("message-id"), get("from"), get("to"), get("cc"), get("reply-to"),
             get("references"), get("subject"), _ts(r["internaldate"], h.get("date")),
-            int("\\seen" not in flags), int("\\flagged" in flags), r.get("size"))
+            int("\\seen" not in flags), int("\\flagged" in flags), r.get("size"), get("list-unsubscribe"))
 
 
 def _update_contacts(db, rows: list[tuple]) -> None:
@@ -239,7 +256,7 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
         rows = [_header_row(acct, key, r) for r in imap.fetch(m, part, HEADER_ITEMS)]
         db.executemany(
             "INSERT OR IGNORE INTO messages(account, folder, uid, message_id, sender, recipients, cc, reply_to, refs, "
-            "subject, ts, unread, flagged, size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "subject, ts, unread, flagged, size, list_unsub) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         _update_contacts(db, rows)
         db.commit()
         if not first:
@@ -266,8 +283,10 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
                     body, atts, msg = parse_full(r["body"])
                 except Exception:  # noqa: BLE001
                     body, atts, msg = "", [], None
-                db.execute("UPDATE messages SET body=?, attachments=? WHERE account=? AND folder=? AND uid=?",
-                           (body, json.dumps(atts), acct.name, key, r["uid"]))
+                unsub = str(msg.get("list-unsubscribe", "") or "") if msg is not None else ""
+                db.execute("UPDATE messages SET body=?, attachments=?, list_unsub=COALESCE(NULLIF(?, ''), list_unsub) "
+                           "WHERE account=? AND folder=? AND uid=?",
+                           (body, json.dumps(atts), unsub, acct.name, key, r["uid"]))
             db.commit()
 
     db.execute("INSERT INTO folders(account, folder, uidvalidity, synced) VALUES (?,?,?,?) "

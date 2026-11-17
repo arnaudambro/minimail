@@ -272,6 +272,20 @@ def cmd_contacts(a):
         print(f"{r['email']:<40} {r['name'] or '':<30} sent={r['sent']} received={r['received']}")
 
 
+def cmd_unsubscribe(a):
+    r = core.unsubscribe(a.id)
+    if a.json:
+        return out_json(r)
+    if r["method"] == "one-click":
+        print("Unsubscribed." if r["ok"] else f"Failed, open: {r['url']}")
+    elif r["method"] == "email":
+        print(f"Sent an unsubscribe email to {r['to']}.")
+    elif r["method"] == "browser":
+        print(f"Open this page to unsubscribe: {r['url']}")
+    else:
+        print(r["error"])
+
+
 def cmd_counts(a):
     results, errors = core.unread_counts(a.account, live=a.live)
     if a.json:
@@ -454,6 +468,9 @@ def build_parser():
 
     s = j(sub.add_parser("delete", help="move messages to Trash")); s.add_argument("ids", nargs="+")
     s.set_defaults(fn=cmd_delete)
+
+    s = j(sub.add_parser("unsubscribe", help="unsubscribe from a mailing list (List-Unsubscribe)"))
+    s.add_argument("id"); s.set_defaults(fn=cmd_unsubscribe)
 
     s = j(sub.add_parser("counts", help="unread/total per account and folder"))
     s.add_argument("--account", "-a", action="append"); s.add_argument("--live", action="store_true")

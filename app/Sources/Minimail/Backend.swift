@@ -39,6 +39,15 @@ struct FullMessage: Codable, Identifiable {
     let reply_to: String
     let body: String
     let attachments: [Attachment]
+    var unsubscribe: Bool? = nil
+}
+
+struct UnsubscribeResult: Codable {
+    let method: String?
+    let ok: Bool
+    let url: String?
+    let to: String?
+    let error: String?
 }
 
 struct AccountInfo: Codable, Identifiable, Hashable {
@@ -166,8 +175,28 @@ func shortDate(_ ts: Double) -> String {
     return d.formatted(date: .numeric, time: .omitted)
 }
 
+private let markdownLink = try! NSRegularExpression(pattern: #"\[([^\]\n]{1,300})\]\(((?:https?|mailto):[^)\s]+)\)"#)
+
+/// Body text to clickable text: [label](url) becomes "label" linked to url, bare URLs become links.
 func linkified(_ text: String) -> AttributedString {
     let capped = text.count > 200_000 ? String(text.prefix(200_000)) + "\n…" : text
+    let ns = capped as NSString
+    var result = AttributedString()
+    var cursor = 0
+    for m in markdownLink.matches(in: capped, range: NSRange(location: 0, length: ns.length)) {
+        if m.range.location > cursor {
+            result += plainLinkified(ns.substring(with: NSRange(location: cursor, length: m.range.location - cursor)))
+        }
+        var label = AttributedString(ns.substring(with: m.range(at: 1)))
+        label.link = URL(string: ns.substring(with: m.range(at: 2)))
+        result += label
+        cursor = m.range.location + m.range.length
+    }
+    if cursor < ns.length { result += plainLinkified(ns.substring(from: cursor)) }
+    return result
+}
+
+private func plainLinkified(_ capped: String) -> AttributedString {
     var attr = AttributedString(capped)
     guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return attr }
     let ns = capped as NSString

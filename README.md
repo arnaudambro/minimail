@@ -3,7 +3,10 @@
 A minimal IMAP mail client for macOS. Three folders, nothing else: **Inbox, Sent, Spam**.
 
 - A native macOS app (SwiftUI) **and** a terminal UI
-- Native macOS notifications for new mail — **click a notification to mark the message as read**
+- **Instant**: a local SQLite cache (kept in sync in the background) — lists, counts and search never wait for the network
+- Full-text search across every account and folder, address autocomplete from your own mail
+- Native macOS notifications for new mail, with **Mark as Read** and **Open** buttons
+- One-click **Unsubscribe** (List-Unsubscribe / RFC 8058)
 - Terminal UI: select all, mark read, move to spam, read a message
 - A scriptable CLI with `--json` output, built so AI agents like [Claude Code](https://claude.com/claude-code) can triage your mail
 - All your accounts in one unified list

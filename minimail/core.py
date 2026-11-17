@@ -185,19 +185,33 @@ def unread_counts(accounts=None, live=False):
 
 
 class _HTMLText(HTMLParser):
+    """HTML to readable text. Links become [text](url) so they stay clickable."""
+
     def __init__(self):
         super().__init__()
         self.parts, self._skip = [], 0
+        self._href, self._link_start = None, 0
 
     def handle_starttag(self, tag, attrs):
         if tag in ("script", "style", "head"):
             self._skip += 1
         if tag in ("br", "p", "div", "tr", "li", "h1", "h2", "h3", "table"):
             self.parts.append("\n")
+        if tag == "a":
+            href = (dict(attrs).get("href") or "").strip()
+            if href.lower().startswith(("http://", "https://", "mailto:")):
+                self._href, self._link_start = href, len(self.parts)
 
     def handle_endtag(self, tag):
         if tag in ("script", "style", "head") and self._skip:
             self._skip -= 1
+        if tag == "a" and self._href:
+            text = " ".join("".join(self.parts[self._link_start:]).split())
+            if text and not self._skip:
+                del self.parts[self._link_start:]
+                href = self._href.replace(" ", "%20").replace(")", "%29")
+                self.parts.append(text if text == href else f"[{text.replace(']', '')}]({href})")
+            self._href = None
 
     def handle_data(self, data):
         if not self._skip:
@@ -234,6 +248,47 @@ def parse_full(raw: bytes):
     return body.strip(), attachments, msg
 
 
+def unsubscribe_info(header: str) -> dict:
+    """Parse List-Unsubscribe: '<https://...>, <mailto:...>'."""
+    urls = re.findall(r"<([^>]+)>", header or "")
+    return {"https": next((u for u in urls if u.lower().startswith("https://")), None),
+            "mailto": next((u for u in urls if u.lower().startswith("mailto:")), None)}
+
+
+def unsubscribe(mid: str) -> dict:
+    """One-click unsubscribe (RFC 8058) when offered, else send the mailto, else return the web page."""
+    import urllib.parse
+    import urllib.request
+    account, folder, uid = parse_id(mid)
+    acct = get_account(account)
+    with imap.session(acct) as m:
+        imap.select(m, acct, folder, readonly=True)
+        rows = imap.fetch(m, [uid], "(UID BODY.PEEK[HEADER.FIELDS (LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])")
+    if not rows:
+        raise SystemExit(f"Message not found: {mid}")
+    h = BytesHeaderParser(policy=policy.default).parsebytes(rows[0]["body"] or b"")
+    info = unsubscribe_info(str(h.get("list-unsubscribe", "") or ""))
+    one_click = "one-click" in str(h.get("list-unsubscribe-post", "") or "").lower()
+    if info["https"] and one_click:
+        req = urllib.request.Request(info["https"], data=b"List-Unsubscribe=One-Click", method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded",
+                                              "User-Agent": "Minimail"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return {"method": "one-click", "ok": r.status < 400, "url": info["https"]}
+        except Exception as e:  # noqa: BLE001
+            return {"method": "browser", "ok": False, "url": info["https"], "error": str(e)}
+    if info["mailto"]:
+        parsed = urllib.parse.urlparse(info["mailto"])
+        q = urllib.parse.parse_qs(parsed.query)
+        to = urllib.parse.unquote(parsed.path)
+        send(account, [to], (q.get("subject") or ["unsubscribe"])[0], (q.get("body") or ["unsubscribe"])[0])
+        return {"method": "email", "ok": True, "to": to}
+    if info["https"]:
+        return {"method": "browser", "ok": True, "url": info["https"]}
+    return {"method": None, "ok": False, "error": "This email has no unsubscribe link."}
+
+
 def get_message(mid: str, mark_read=False, live=False) -> dict:
     account, folder, uid = parse_id(mid)
     acct = get_account(account)
@@ -243,7 +298,8 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
         if r is not None and r["body"] is not None:
             info = store.row_to_summary(r)
             info.update({"cc": r["cc"] or "", "reply_to": r["reply_to"] or "", "references": r["refs"] or "",
-                         "body": r["body"], "attachments": json.loads(r["attachments"] or "[]")})
+                         "body": r["body"], "attachments": json.loads(r["attachments"] or "[]"),
+                         "unsubscribe": bool(r["list_unsub"])})
             if mark_read and info["unread"]:
                 set_seen([mid], True)
                 info["unread"] = False
@@ -266,10 +322,12 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
         "references": str(msg.get("references", "") or ""),
         "body": body,
         "attachments": attachments,
+        "unsubscribe": bool(msg.get("list-unsubscribe")),
     })
     try:
         db = store.connect()
-        store.store_body(db, account, folder, uid, body, attachments, info["cc"], info["reply_to"], info["references"])
+        store.store_body(db, account, folder, uid, body, attachments, info["cc"], info["reply_to"], info["references"],
+                         str(msg.get("list-unsubscribe", "") or ""))
         if mark_read:
             store.set_unread(db, account, folder, [uid], False)
     except Exception:  # noqa: BLE001

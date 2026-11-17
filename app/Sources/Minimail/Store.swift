@@ -34,6 +34,11 @@ final class Store: ObservableObject {
     @Published var unreadOnly = false {
         didSet { if oldValue != unreadOnly { Task { await reload() } } }
     }
+    /// Full-text search over every folder (local, instant).
+    @Published var search = "" {
+        didSet { if oldValue != search { Task { await reload() } } }
+    }
+    @Published var syncing = false
     @Published var accounts: [AccountInfo] = []
     @Published var messages: [Message] = []
     @Published var selection = Set<String>()
@@ -58,6 +63,9 @@ final class Store: ObservableObject {
     private var pendingUnread: [String: Bool] = [:]
     private var pendingRemoved = Set<String>()
     private var started = false
+    private var db: MailDB?
+    private var lastDataVersion = -1
+    private var lastSync = Date.distantPast
 
     var activeFolder: Folder { folder ?? .inbox }
     var unreadCount: Int { messages.lazy.filter(\.unread).count }
@@ -71,10 +79,44 @@ final class Store: ObservableObject {
         Task { await loadProviders() }
         Task { await loadNotif() }
         await reload()
+        Task { await sync() }
+        // Watch the local database: the background sync writes, we re-read (cheap, local).
+        var ticks = 0
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(90))
-            await reload(silent: true)
+            try? await Task.sleep(for: .seconds(1))
+            ticks += 1
+            if let v = await database()?.dataVersionAsync(), v != lastDataVersion {
+                lastDataVersion = v
+                await reload(silent: true)
+            }
+            // Without the background watcher, sync from here every minute.
+            if ticks % 60 == 0, notif?.running != true { await sync() }
         }
+    }
+
+    private func database() async -> MailDB? {
+        if db == nil { db = MailDB() }
+        return db
+    }
+
+    /// Ask the servers for news. The results land in the database, which the loop above picks up.
+    func sync() async {
+        guard !syncing, !accounts.isEmpty else { return }
+        syncing = true
+        defer { syncing = false; lastSync = .now }
+        do {
+            let data = try await CLI.run(["sync", "--json", "--bodies", "40"])
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                errors = (obj["errors"] as? [String: String]) ?? [:]
+            }
+        } catch {
+            banner = error.localizedDescription
+        }
+        await reload(silent: true)
+    }
+
+    func contacts(_ prefix: String) -> [Contact] {
+        db?.contacts(prefix: prefix) ?? []
     }
 
     func loadAccounts() async {
@@ -148,7 +190,11 @@ final class Store: ObservableObject {
     }
 
     func setNotifications(_ on: Bool) async {
-        await perform { _ = try await CLI.run(["daemon", on ? "install" : "uninstall"]) }
+        // Prefer the native agent bundled in this app (Minimail icon, action buttons).
+        let agent = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LoginItems/MinimailAgent.app/Contents/MacOS/MinimailAgent").path
+        var args = ["daemon", on ? "install" : "uninstall"]
+        if on, FileManager.default.isExecutableFile(atPath: agent) { args += ["--agent", agent] }
+        await perform { _ = try await CLI.run(args) }
         try? await Task.sleep(for: .milliseconds(500))
         await loadNotif()
     }
@@ -177,40 +223,33 @@ final class Store: ObservableObject {
     func reload(silent: Bool = false) async {
         generation += 1
         let gen = generation
-        if !silent { loading = true }
-        var args = ["list", "--json", "-f", activeFolder.rawValue, "-n", "40"]
-        if let account { args += ["-a", account] }
-        if unreadOnly { args.append("--unread") }
-        do {
-            let r = try await CLI.json(ListResponse.self, args)
-            guard gen == generation else { return }
-            messages = applyPending(r.messages)
-            errors = r.errors
-            selection = selection.intersection(Set(r.messages.map(\.id)))
-            if !silent { banner = nil }
-        } catch {
-            guard gen == generation else { return }
-            banner = error.localizedDescription
+        guard let db = await database() else {
+            // No cache yet: the first sync creates it.
+            loading = !accounts.isEmpty
+            return
         }
+        let folder = search.isEmpty ? activeFolder.rawValue : nil
+        let (account, unreadOnly, search) = (self.account, self.unreadOnly, self.search)
+        let (list, counts) = await withCheckedContinuation { c in
+            db.queue.async {
+                c.resume(returning: (db.messages(folder: folder, account: account, unreadOnly: unreadOnly, search: search),
+                                     db.counts()))
+            }
+        }
+        guard gen == generation else { return }
+        messages = applyPending(list)
+        selection = selection.intersection(Set(messages.map(\.id)))
         loading = false
-        await refreshCounts()
+        if !silent { banner = nil }
+        // Keep optimistic counts while a server call is still running.
+        if inFlight == 0 {
+            unread = counts
+            updateBadge()
+        }
     }
 
     func refreshCounts() async {
-        let version = countsVersion
-        guard let data = try? await CLI.run(["counts", "--json"]),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let accts = obj["accounts"] as? [String: Any] else { return }
-        // Something changed locally while we waited: the server numbers may be stale.
-        guard version == countsVersion, inFlight == 0 else { return }
-        var counts: [String: [String: Int]] = [:]
-        for (name, v) in accts {
-            for (folder, c) in (v as? [String: Any]) ?? [:] {
-                if let n = (c as? [String: Any])?["unread"] as? Int { counts[name, default: [:]][folder] = n }
-            }
-        }
-        unread = counts
-        updateBadge()
+        await reload(silent: true)
     }
 
     func unreadCount(_ folder: Folder, account: String? = nil) -> Int {
@@ -231,10 +270,26 @@ final class Store: ObservableObject {
     }
 
     func open(_ id: String) async {
+        guard let msg = messages.first(where: { $0.id == id }) else { return }
+        let wasUnread = msg.unread
+        if wasUnread { setLocal([id], unread: false); pendingUnread[id] = false }
+        // 1. Instant: the body is usually already in the local cache.
+        if let db, let cached = await withCheckedContinuation({ c in db.queue.async { c.resume(returning: db.fullMessage(msg)) } }) {
+            if selection == [id] { current = cached }
+            if wasUnread {
+                inFlight += 1
+                defer { inFlight -= 1 }
+                do { _ = try await CLI.run(["mark-read", "--json", id]) } catch {
+                    setLocal([id], unread: true)
+                    banner = error.localizedDescription
+                }
+                pendingUnread[id] = nil
+            }
+            return
+        }
+        // 2. Not cached yet: fetch it from the server (this also caches it).
         loadingMessage = true
         defer { loadingMessage = false }
-        let wasUnread = messages.first { $0.id == id }?.unread ?? false
-        if wasUnread { setLocal([id], unread: false); pendingUnread[id] = false }
         inFlight += 1
         defer { inFlight -= 1 }
         var args = ["show", id, "--json"]
@@ -248,6 +303,23 @@ final class Store: ObservableObject {
             pendingUnread[id] = nil
             if wasUnread { setLocal([id], unread: true) }
             banner = error.localizedDescription
+        }
+    }
+
+    /// minimail://open?id=<account:folder:uid> (from a notification)
+    func openURL(_ url: URL) {
+        guard url.scheme == "minimail",
+              let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "id" })?.value
+        else { return }
+        let parts = id.split(separator: ":")
+        guard parts.count == 3, let f = Folder(rawValue: String(parts[1])) else { return }
+        search = ""
+        account = nil
+        folder = f
+        Task {
+            await reload()
+            selection = [id]
+            selectionChanged()
         }
     }
 
@@ -356,6 +428,25 @@ final class Store: ObservableObject {
     private func updateBadge() {
         let total = unreadCount(.inbox)
         NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
+    }
+
+    func unsubscribe(_ id: String) async {
+        do {
+            let r = try await CLI.json(UnsubscribeResult.self, ["unsubscribe", id, "--json"])
+            switch r.method {
+            case "one-click" where r.ok: banner = "Unsubscribed."
+            case "email": banner = "Sent an unsubscribe email to \(r.to ?? "the sender")."
+            default:
+                if let u = r.url.flatMap(URL.init(string:)) {
+                    NSWorkspace.shared.open(u)
+                    banner = "Opened the unsubscribe page in your browser."
+                } else {
+                    banner = r.error ?? "No unsubscribe link in this email."
+                }
+            }
+        } catch {
+            banner = error.localizedDescription
+        }
     }
 
     func newMessage() {

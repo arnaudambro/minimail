@@ -9,6 +9,7 @@ struct MinimailApp: App {
         Window("Minimail", id: "main") {
             ContentView()
                 .environmentObject(store)
+                .onOpenURL { store.openURL($0) }
                 .frame(minWidth: 860, minHeight: 500)
                 .task { await store.start() }
         }
@@ -31,7 +32,7 @@ struct MinimailApp: App {
                 Button("Delete") { Task { await store.delete() } }
                     .keyboardShortcut(.delete, modifiers: .command)
                 Divider()
-                Button("Refresh") { Task { await store.reload() } }.keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Get New Mail") { Task { await store.sync() } }.keyboardShortcut("n", modifiers: [.command, .shift])
             }
         }
     }
@@ -141,7 +142,8 @@ struct MessageList: View {
 
     var body: some View {
         List(store.messages, selection: $store.selection) { m in
-            MessageRow(message: m, showAccount: store.account == nil && store.accounts.count > 1, folder: store.activeFolder)
+            MessageRow(message: m, showAccount: store.account == nil && store.accounts.count > 1,
+                       showFolder: !store.search.isEmpty, folder: Folder(rawValue: m.folder) ?? store.activeFolder)
                 .tag(m.id)
                 .contextMenu {
                     Button(m.unread ? "Mark as Read" : "Mark as Unread") {
@@ -173,12 +175,15 @@ struct MessageList: View {
                 } actions: {
                     Button("Add Account") { store.showAddAccount = true }.buttonStyle(.borderedProminent)
                 }
+            } else if store.messages.isEmpty && !store.search.isEmpty {
+                ContentUnavailableView.search(text: store.search)
             } else if store.messages.isEmpty && !store.loading {
                 ContentUnavailableView(store.unreadOnly ? "No Unread Mail" : "No Mail", systemImage: store.activeFolder.icon)
             }
         }
         .safeAreaInset(edge: .bottom) { StatusBar() }
-        .navigationTitle(store.activeFolder.title)
+        .searchable(text: $store.search, placement: .toolbar, prompt: "Search all mail")
+        .navigationTitle(store.search.isEmpty ? store.activeFolder.title : "Search")
         .navigationSubtitle(subtitle)
         .toolbar {
             ToolbarItemGroup {
@@ -204,14 +209,14 @@ struct MessageList: View {
                     Label("Unread Only", systemImage: "line.3.horizontal.decrease.circle")
                 }
                 .help("Show unread only")
-                Button { Task { await store.reload() } } label: {
-                    if store.loading || store.busy {
+                Button { Task { await store.sync() } } label: {
+                    if store.syncing {
                         ProgressView().controlSize(.small)
                     } else {
-                        Label("Refresh", systemImage: "arrow.clockwise")
+                        Label("Get New Mail", systemImage: "arrow.clockwise")
                     }
                 }
-                .help("Refresh (⇧⌘N)")
+                .help("Get new mail (⇧⌘N). Minimail also checks by itself.")
             }
         }
     }
@@ -226,6 +231,7 @@ struct MessageList: View {
 struct MessageRow: View {
     let message: Message
     let showAccount: Bool
+    var showFolder = false
     let folder: Folder
 
     var body: some View {
@@ -246,8 +252,10 @@ struct MessageRow: View {
                     .font(.callout)
                     .foregroundStyle(message.unread ? .primary : .secondary)
                     .lineLimit(1)
-                if showAccount {
-                    Text(message.account).font(.caption2).foregroundStyle(.tertiary)
+                if showAccount || showFolder {
+                    Text([showAccount ? message.account : nil, showFolder ? folder.title : nil]
+                        .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.tertiary)
                 }
             }
         }
@@ -317,6 +325,23 @@ struct DetailView: View {
     }
 }
 
+struct UnsubscribeButton: View {
+    @EnvironmentObject var store: Store
+    let id: String
+    @State private var working = false
+
+    var body: some View {
+        Button {
+            Task { working = true; await store.unsubscribe(id); working = false }
+        } label: {
+            if working { ProgressView().controlSize(.mini) } else { Text("Unsubscribe") }
+        }
+        .controlSize(.small)
+        .disabled(working)
+        .help("Unsubscribe from this mailing list")
+    }
+}
+
 struct MessageView: View {
     let message: FullMessage
 
@@ -329,6 +354,9 @@ struct MessageView: View {
                     Text(senderName(message.from)).font(.headline)
                     Text(senderEmail(message.from)).foregroundStyle(.secondary)
                     Spacer()
+                    if message.unsubscribe == true {
+                        UnsubscribeButton(id: message.id)
+                    }
                     Text(formattedDate).font(.caption).foregroundStyle(.secondary)
                 }
                 VStack(alignment: .leading, spacing: 2) {
@@ -356,7 +384,11 @@ struct MessageView: View {
     }
 
     private var formattedDate: String {
-        guard let d = ISO8601DateFormatter.flexible.date(from: message.date) else { return message.date }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mmXXXXX"
+        guard let d = ISO8601DateFormatter.flexible.date(from: message.date) ?? ISO8601DateFormatter().date(from: message.date)
+                ?? f.date(from: message.date) else { return message.date }
         return d.formatted(date: .abbreviated, time: .shortened)
     }
 }
@@ -384,7 +416,7 @@ struct ComposeView: View {
                 Picker("From", selection: $draft.account) {
                     ForEach(store.accounts) { a in Text(a.email).tag(a.name) }
                 }
-                TextField("To", text: $draft.to, prompt: Text("name@example.com, …"))
+                AddressField(text: $draft.to)
                 TextField("Subject", text: $draft.subject)
             }
             .padding()
@@ -425,5 +457,76 @@ struct ComposeView: View {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+}
+
+
+// MARK: - Address autocomplete
+
+/// "To" field that suggests addresses found in your mail (people you write to come first).
+struct AddressField: View {
+    @EnvironmentObject var store: Store
+    @Binding var text: String
+    @State private var suggestions: [Contact] = []
+    @State private var highlighted = 0
+    @FocusState private var focused: Bool
+
+    private var token: String {
+        String(text.split(separator: ",", omittingEmptySubsequences: false).last ?? "").trimmingCharacters(in: .whitespaces)
+    }
+
+    var body: some View {
+        TextField("To", text: $text, prompt: Text("name@example.com, …"))
+            .focused($focused)
+            .onChange(of: text) { refresh() }
+            .onKeyPress(.downArrow) { move(1) }
+            .onKeyPress(.upArrow) { move(-1) }
+            .onKeyPress(.tab) { pick() }
+            .onKeyPress(.return) { pick() }
+            .onKeyPress(.escape) {
+                guard !suggestions.isEmpty else { return .ignored }
+                suggestions = []
+                return .handled
+            }
+        if focused {
+            ForEach(Array(suggestions.enumerated()), id: \.element) { i, c in
+                HStack {
+                    Text(c.name.isEmpty ? c.email : c.name).lineLimit(1)
+                    if !c.name.isEmpty { Text(c.email).foregroundStyle(.secondary).lineLimit(1) }
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+                .padding(.horizontal, 6)
+                .background(i == highlighted ? Color.accentColor.opacity(0.2) : .clear, in: RoundedRectangle(cornerRadius: 5))
+                .contentShape(Rectangle())
+                .onTapGesture { choose(c) }
+            }
+        }
+    }
+
+    private func refresh() {
+        let t = token
+        suggestions = t.count >= 1 && !t.contains("<") ? store.contacts(t).filter { !text.contains($0.email) } : []
+        highlighted = 0
+    }
+
+    private func move(_ d: Int) -> KeyPress.Result {
+        guard !suggestions.isEmpty else { return .ignored }
+        highlighted = (highlighted + d + suggestions.count) % suggestions.count
+        return .handled
+    }
+
+    private func pick() -> KeyPress.Result {
+        guard suggestions.indices.contains(highlighted) else { return .ignored }
+        choose(suggestions[highlighted])
+        return .handled
+    }
+
+    private func choose(_ c: Contact) {
+        var parts = text.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        if parts.isEmpty { parts = [""] }
+        parts[parts.count - 1] = c.formatted
+        text = parts.filter { !$0.isEmpty }.joined(separator: ", ") + ", "
+        suggestions = []
     }
 }
