@@ -48,12 +48,18 @@ def cmd_account_add(a):
         raise SystemExit("custom provider needs --imap-host and --smtp-host")
     print(p["help"], file=sys.stderr)
     password = sys.stdin.readline().rstrip("\n") if a.password_stdin else getpass.getpass(f"Password for {acct.email}: ")
-    keychain_set(acct.name, password)
+    keychain_set(acct.name, _clean(acct, password))
     accts.append(acct)
     save_accounts(accts)
-    if not a.no_test:
-        _test(acct)
-    print(f"Added {acct.name}.")
+    if a.no_test or _test(acct):
+        print(f"Added {acct.name}.")
+    else:
+        print(f"Saved {acct.name}, but the login failed. Fix the password with: minimail account password {acct.name}")
+
+
+def _clean(acct: Account, password: str) -> str:
+    # Google shows app passwords as "abcd efgh ijkl mnop"; the real password has no spaces.
+    return password.replace(" ", "") if acct.provider == "gmail" else password
 
 
 def _test(acct: Account) -> bool:
@@ -96,10 +102,11 @@ def cmd_account_remove(a):
 
 
 def cmd_account_password(a):
-    get_account(a.name)
+    acct = get_account(a.name)
     password = sys.stdin.readline().rstrip("\n") if a.password_stdin else getpass.getpass(f"New password for {a.name}: ")
-    keychain_set(a.name, password)
+    keychain_set(a.name, _clean(acct, password))
     print("Saved in Keychain.")
+    _test(acct)
 
 
 def _edit(name, fn):
