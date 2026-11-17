@@ -50,6 +50,9 @@ final class Store: ObservableObject {
     @Published var notif: NotifStatus?
 
     private var generation = 0
+    // Optimistic changes not yet confirmed by the server. A reload must not undo them.
+    private var pendingUnread: [String: Bool] = [:]
+    private var pendingRemoved = Set<String>()
     private var started = false
 
     var activeFolder: Folder { folder ?? .inbox }
@@ -177,7 +180,7 @@ final class Store: ObservableObject {
         do {
             let r = try await CLI.json(ListResponse.self, args)
             guard gen == generation else { return }
-            messages = r.messages
+            messages = applyPending(r.messages)
             errors = r.errors
             selection = selection.intersection(Set(r.messages.map(\.id)))
             if !silent { banner = nil }
@@ -216,15 +219,27 @@ final class Store: ObservableObject {
         loadingMessage = true
         defer { loadingMessage = false }
         let wasUnread = messages.first { $0.id == id }?.unread ?? false
+        if wasUnread { setLocal([id], unread: false); pendingUnread[id] = false }
         var args = ["show", id, "--json"]
         if wasUnread { args.append("--mark-read") }
         do {
             let m = try await CLI.json(FullMessage.self, args)
+            pendingUnread[id] = nil
             guard selection == [id] else { return }
             current = m
-            if wasUnread { setLocal([id], unread: false) }
         } catch {
+            pendingUnread[id] = nil
+            if wasUnread { setLocal([id], unread: true) }
             banner = error.localizedDescription
+        }
+    }
+
+    private func applyPending(_ list: [Message]) -> [Message] {
+        list.compactMap { m in
+            if pendingRemoved.contains(m.id) { return nil }
+            var m = m
+            if let u = pendingUnread[m.id] { m.unread = u }
+            return m
         }
     }
 
@@ -240,18 +255,41 @@ final class Store: ObservableObject {
         NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
     }
 
+    /// Optimistic: the UI changes at once, the server call runs after, and a failure undoes the change.
     func setRead(_ read: Bool) async {
         let ids = targets.filter { id in messages.first { $0.id == id }?.unread == read }
         guard !ids.isEmpty else { return }
-        await perform { _ = try await CLI.run([read ? "mark-read" : "mark-unread", "--json"] + ids) }
         setLocal(ids, unread: !read)
+        for id in ids { pendingUnread[id] = !read }
+        do {
+            _ = try await CLI.run([read ? "mark-read" : "mark-unread", "--json"] + ids)
+        } catch {
+            setLocal(ids, unread: read)
+            banner = error.localizedDescription
+        }
+        for id in ids { pendingUnread[id] = nil }
     }
 
     func markAllRead() async {
+        let ids = messages.filter(\.unread).map(\.id)
+        let savedCounts = inboxUnread
+        setLocal(ids, unread: false)
+        if activeFolder == .inbox {
+            for name in account.map({ [$0] }) ?? Array(inboxUnread.keys) { inboxUnread[name] = 0 }
+            updateBadge()
+        }
+        for id in ids { pendingUnread[id] = false }
         var args = ["mark-read", "--all", "--json", "-f", activeFolder.rawValue]
         if let account { args += ["-a", account] }
-        await perform { _ = try await CLI.run(args) }
-        setLocal(messages.map(\.id), unread: false)
+        do {
+            _ = try await CLI.run(args)
+        } catch {
+            setLocal(ids, unread: true)
+            inboxUnread = savedCounts
+            updateBadge()
+            banner = error.localizedDescription
+        }
+        for id in ids { pendingUnread[id] = nil }
         await refreshCounts()
     }
 
@@ -259,12 +297,25 @@ final class Store: ObservableObject {
         guard activeFolder != .sent else { return }
         let ids = targets
         guard !ids.isEmpty else { return }
-        await perform { _ = try await CLI.run([self.activeFolder == .spam ? "not-spam" : "spam", "--json"] + ids) }
         let set = Set(ids)
+        let removed = messages.filter { set.contains($0.id) }
         messages.removeAll { set.contains($0.id) }
+        pendingRemoved.formUnion(set)
         selection = []
         current = nil
+        do {
+            _ = try await CLI.run([activeFolder == .spam ? "not-spam" : "spam", "--json"] + ids)
+        } catch {
+            messages = (messages + removed).sorted { $0.ts > $1.ts }
+            banner = error.localizedDescription
+        }
+        pendingRemoved.subtract(set)
         await refreshCounts()
+    }
+
+    private func updateBadge() {
+        let total = inboxUnread.values.reduce(0, +)
+        NSApp.dockTile.badgeLabel = total > 0 ? "\(total)" : nil
     }
 
     func newMessage() {
