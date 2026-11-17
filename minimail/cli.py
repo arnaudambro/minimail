@@ -31,7 +31,8 @@ def cmd_account_add(a):
         raise SystemExit("Account name must be lowercase letters, digits, '.', '_' or '-'.")
     accts = load_accounts(include_disabled=True)
     if any(x.name == a.name for x in accts):
-        raise SystemExit(f"Account '{a.name}' already exists.")
+        raise SystemExit(f"Account '{a.name}' already exists. Change it with `minimail account edit {a.name} ...`, "
+                         f"or remove it with `minimail account remove {a.name}`.")
     p = PROVIDERS[a.provider]
     imap_host, imap_port, imap_sec = p["imap"]
     smtp_host, smtp_port, smtp_sec = p["smtp"]
@@ -144,6 +145,22 @@ def _edit(name, fn):
 def cmd_account_enable(a, enabled):
     _edit(a.name, lambda x: setattr(x, "enabled", enabled))
     print(f"{a.name} {'enabled' if enabled else 'disabled'}.")
+
+
+def cmd_account_edit(a):
+    fields = {"username": a.username, "display_name": a.display_name, "email": a.email,
+              "imap_host": a.imap_host, "imap_port": a.imap_port, "imap_security": a.imap_security,
+              "smtp_host": a.smtp_host, "smtp_port": a.smtp_port, "smtp_security": a.smtp_security}
+    changes = {k: v for k, v in fields.items() if v is not None}
+    if not changes:
+        raise SystemExit("Nothing to change. See `minimail account edit --help`.")
+    acct = _edit(a.name, lambda x: [setattr(x, k, v) for k, v in changes.items()])
+    imap.forget_folders(a.name)
+    if a.json:
+        ok, err = _check(acct)
+        return out_json({"name": a.name, "ok": ok, "error": None if ok else err})
+    print(f"Updated {a.name}: " + ", ".join(f"{k}={v}" for k, v in changes.items()))
+    _test(acct)
 
 
 def cmd_account_folder(a):
@@ -359,6 +376,14 @@ def build_parser():
     s = acc.add_parser("password", help="change the stored password")
     s.add_argument("name"); s.add_argument("--password-stdin", action="store_true"); s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_account_password)
+    s = j(acc.add_parser("edit", help="change account settings (username, servers, ...)"))
+    s.add_argument("name")
+    s.add_argument("--username"); s.add_argument("--display-name"); s.add_argument("--email")
+    s.add_argument("--imap-host"); s.add_argument("--imap-port", type=int)
+    s.add_argument("--imap-security", choices=["ssl", "starttls"])
+    s.add_argument("--smtp-host"); s.add_argument("--smtp-port", type=int)
+    s.add_argument("--smtp-security", choices=["ssl", "starttls"])
+    s.set_defaults(fn=cmd_account_edit)
     s = acc.add_parser("enable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, True))
     s = acc.add_parser("disable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, False))
     s = acc.add_parser("folder", help="override the server folder used for sent/spam")

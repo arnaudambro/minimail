@@ -36,6 +36,7 @@ minimail account add apple me@icloud.com --provider icloud
 minimail account add proton me@proton.me --provider proton-bridge --username <bridge username>
 minimail account add work me@company.com --provider custom --imap-host imap.company.com --smtp-host smtp.company.com
 minimail account test
+minimail account edit perso --username other-login   # change username, servers, ...
 ```
 
 Most providers require an **app password** (Gmail, iCloud, Yahoo). Proton Mail works through
