@@ -51,6 +51,14 @@ struct AccountsSettings: View {
                     .help("Remove the selected account")
                     .disabled(selected == nil)
                 Spacer()
+                if let a = store.accounts.first(where: { $0.name == selected }) {
+                    Toggle("Read status on this Mac only", isOn: Binding(
+                        get: { a.localRead },
+                        set: { on in Task { await store.setLocalRead(a.name, on) } }
+                    ))
+                    .help("For a mailbox you share with someone: marking an email as read or unread changes it only in Minimail. The server keeps its read state for the other person, and new emails stay unread for you even if they read them.")
+                    .disabled(store.busy)
+                }
                 Button("Change Password…") { passwordFor = store.accounts.first { $0.name == selected } }
                     .disabled(selected == nil)
             }

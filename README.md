@@ -45,6 +45,10 @@ minimail account edit perso --username other-login   # change username, servers,
 Most providers require an **app password** (Gmail, iCloud, Yahoo). Proton Mail works through
 [Proton Mail Bridge](https://proton.me/mail/bridge) — use the credentials the Bridge shows.
 
+**Shared mailbox** (e.g. with your partner): `minimail account local-read <name> on`
+(or Settings › Accounts › *Read status on this Mac only*). Read / unread then changes only in Minimail;
+the server's read state stays for the other person, and new mail stays unread for you even if they read it.
+
 Sent and Spam folders are discovered automatically (IMAP SPECIAL-USE, then common names).
 Override if needed: `minimail account folder perso spam "Junk"`.
 
@@ -56,6 +60,7 @@ minimail counts                         # unread per account
 minimail list --unread                  # unified unread inbox
 minimail list -f spam
 minimail show perso:inbox:4821
+minimail attachments perso:inbox:4821   # save its attachments to ~/Downloads (--dir to change)
 minimail mark-read --all                # select all → read, every account
 minimail spam perso:inbox:4821
 minimail delete perso:inbox:4821        # move to Trash

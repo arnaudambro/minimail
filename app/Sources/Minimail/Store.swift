@@ -63,6 +63,10 @@ final class Store: ObservableObject {
     @Published var showAddAccount = false
     @Published var providers: [ProviderInfo] = []
     @Published var notif: NotifStatus?
+    /// Quick Look: the attachment shown, and the files of the current message (arrows move between them).
+    @Published var quickLookURL: URL?
+    @Published var attachmentURLs: [URL] = []
+    @Published var loadingAttachments = false
 
     private var generation = 0
     // Optimistic changes not yet confirmed by the server. A reload must not undo them.
@@ -95,8 +99,9 @@ final class Store: ObservableObject {
                 lastDataVersion = v
                 await reload(silent: true)
             }
-            // Without the background watcher, sync from here every minute.
-            if ticks % 60 == 0, notif?.running != true { await sync() }
+            // Without the background watcher, sync from here every minute. Also while an account shows
+            // an error: the watcher does not report errors, so only a new sync can clear it.
+            if ticks % 60 == 0, notif?.running != true || !errors.isEmpty { await sync() }
         }
     }
 
@@ -167,6 +172,13 @@ final class Store: ObservableObject {
         } catch {
             return error.localizedDescription
         }
+    }
+
+    /// Shared mailbox: read/unread stays on this Mac, the server's read state is left to the other person.
+    func setLocalRead(_ name: String, _ on: Bool) async {
+        await perform { _ = try await CLI.run(["account", "local-read", name, on ? "on" : "off", "--json"]) }
+        await loadAccounts()
+        if !on { await sync() }  // take the server's read state again
     }
 
     func removeAccount(_ name: String) async {
@@ -272,6 +284,7 @@ final class Store: ObservableObject {
     }
 
     func selectionChanged() {
+        quickLookURL = nil
         if selection.count == 1, let id = selection.first {
             if current?.id != id { Task { await open(id) } }
         } else {
@@ -506,7 +519,18 @@ final class Store: ObservableObject {
     func reply() {
         guard let m = current else { return }
         let subject = m.subject.lowercased().hasPrefix("re:") ? m.subject : "Re: \(m.subject)"
-        compose = Draft(account: m.account, to: m.reply_to.isEmpty ? m.from : m.reply_to, subject: subject, replyTo: m.id)
+        // The original goes in the editable body (same format as the CLI), so it can be trimmed or edited.
+        var head = ["From: \(m.from)", "Sent: \(sentDate(m.date))", "To: \(m.to)"]
+        if !m.cc.isEmpty { head.append("Cc: \(m.cc)") }
+        head.append("Subject: \(m.subject)")
+        let original = m.body.replacingOccurrences(of: "\r\n", with: "\n").trimmingCharacters(in: .newlines)
+        let body = "\n\n" + String(repeating: "-", count: 40) + "\n" + head.joined(separator: "\n") + "\n\n" + original + "\n"
+        compose = Draft(account: m.account, to: m.reply_to.isEmpty ? m.from : m.reply_to, subject: subject, body: body, replyTo: m.id)
+    }
+
+    private func sentDate(_ s: String) -> String {
+        guard let d = ISO8601DateFormatter.flexible.date(from: s) ?? ISO8601DateFormatter().date(from: s) else { return s }
+        return d.formatted(.dateTime.weekday(.wide).day().month(.wide).year().hour().minute())
     }
 
     func forward() {
@@ -528,7 +552,7 @@ final class Store: ObservableObject {
                 if !t.isEmpty { args += [flag, t] }
             }
         }
-        if let r = d.replyTo { args += ["--reply", r] }
+        if let r = d.replyTo { args += ["--reply", r, "--no-quote"] }
         if let f = d.forwardOf { args += ["--forward", f] }
         _ = try await CLI.run(args, input: d.body)
     }
@@ -537,5 +561,102 @@ final class Store: ObservableObject {
         busy = true
         defer { busy = false }
         do { try await work() } catch { banner = error.localizedDescription }
+    }
+
+    // MARK: - Attachments
+
+    /// Attachments are saved once per message in ~/Library/Caches/Minimail/attachments/<id>/.
+    private func attachmentDir(_ id: String) -> URL {
+        let safe = id.map { $0.isLetter || $0.isNumber || $0 == "-" ? $0 : "_" }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Minimail/attachments/\(String(safe))", isDirectory: true)
+    }
+
+    private struct SavedAttachment: Decodable { let path: String }
+
+    func attachmentFiles(for message: FullMessage) async -> [URL]? {
+        let dir = attachmentDir(message.id)
+        let fm = FileManager.default
+        if let names = try? fm.contentsOfDirectory(atPath: dir.path), names.count == message.attachments.count,
+           let marker = try? String(contentsOf: dir.appendingPathComponent(".order"), encoding: .utf8) {
+            let urls = marker.split(separator: "\n").map { dir.appendingPathComponent(String($0)) }
+            if urls.count == message.attachments.count, urls.allSatisfy({ fm.fileExists(atPath: $0.path) }) { return urls }
+        }
+        loadingAttachments = true
+        defer { loadingAttachments = false }
+        do {
+            try? fm.removeItem(at: dir)
+            let saved = try await CLI.json([SavedAttachment].self, ["attachments", "--json", message.id, "--dir", dir.path])
+            let urls = saved.map { URL(fileURLWithPath: $0.path) }
+            try? urls.map(\.lastPathComponent).joined(separator: "\n")
+                .write(to: dir.appendingPathComponent(".order"), atomically: true, encoding: .utf8)
+            return urls
+        } catch {
+            banner = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Show attachment `index` of the current message in Quick Look.
+    func previewAttachment(_ index: Int = 0) async {
+        guard let m = current, !m.attachments.isEmpty, let urls = await attachmentFiles(for: m),
+              current?.id == m.id, urls.indices.contains(index) else { return }
+        attachmentURLs = urls
+        quickLookURL = urls[index]
+    }
+
+    /// Space bar: open Quick Look on the first attachment, or close it.
+    func toggleQuickLook() {
+        if quickLookURL != nil { quickLookURL = nil } else { Task { await previewAttachment() } }
+    }
+
+    func openAttachment(_ index: Int) async {
+        guard let m = current, let urls = await attachmentFiles(for: m), urls.indices.contains(index) else { return }
+        NSWorkspace.shared.open(urls[index])
+    }
+
+    /// Open an .ics invitation in Apple Calendar (it shows the event and lets you add or answer it).
+    func addToCalendar(_ index: Int) async {
+        guard let m = current, let urls = await attachmentFiles(for: m), urls.indices.contains(index) else { return }
+        guard let cal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.iCal") else {
+            NSWorkspace.shared.open(urls[index])
+            return
+        }
+        do {
+            try await NSWorkspace.shared.open([urls[index]], withApplicationAt: cal, configuration: .init())
+        } catch {
+            banner = error.localizedDescription
+        }
+    }
+
+    func saveAttachment(_ index: Int) async {
+        guard let m = current, let urls = await attachmentFiles(for: m), urls.indices.contains(index) else { return }
+        if let dest = copyToDownloads(urls[index]) { NSWorkspace.shared.activateFileViewerSelecting([dest]) }
+    }
+
+    func saveAllAttachments() async {
+        guard let m = current, let urls = await attachmentFiles(for: m) else { return }
+        let saved = urls.compactMap(copyToDownloads)
+        if !saved.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(saved) }
+    }
+
+    /// Copy into ~/Downloads without overwriting: "name (2).pdf" if the name is taken.
+    private func copyToDownloads(_ src: URL) -> URL? {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        var dest = downloads.appendingPathComponent(src.lastPathComponent)
+        var n = 2
+        while FileManager.default.fileExists(atPath: dest.path) {
+            let ext = src.pathExtension
+            let stem = src.deletingPathExtension().lastPathComponent
+            dest = downloads.appendingPathComponent(ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)")
+            n += 1
+        }
+        do {
+            try FileManager.default.copyItem(at: src, to: dest)
+            return dest
+        } catch {
+            banner = error.localizedDescription
+            return nil
+        }
     }
 }

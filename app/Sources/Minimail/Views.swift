@@ -1,4 +1,7 @@
 import SwiftUI
+import WebKit
+import QuickLook
+import UniformTypeIdentifiers
 
 @main
 struct MinimailApp: App {
@@ -12,6 +15,7 @@ struct MinimailApp: App {
                 .onOpenURL { store.openURL($0) }
                 .frame(minWidth: 860, minHeight: 500)
                 .task { await store.start() }
+                .onAppear { delegate.installSpaceKey(store) }
         }
         Settings {
             SettingsView().environmentObject(store)
@@ -24,7 +28,7 @@ struct MinimailApp: App {
             CommandGroup(replacing: .undoRedo) {
                 Button("Undo") {
                     // In a text field: undo typing. Elsewhere: undo the last delete / spam.
-                    if NSApp.keyWindow?.firstResponder is NSText || NSApp.keyWindow?.sheetParent != nil {
+                    if NSApp.keyWindow?.firstResponder is NSText || NSApp.keyWindow?.sheetParent != nil || store.compose != nil {
                         NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
                     } else {
                         Task { await store.undo() }
@@ -38,9 +42,13 @@ struct MinimailApp: App {
                 Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }.keyboardShortcut("c")
                 Button("Paste") { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }.keyboardShortcut("v")
                 Button("Select All") {
-                    // In a text field (search, compose): select its text. Elsewhere: select every message.
+                    // In a text field (search, compose) or the mail body: select its text.
+                    // Elsewhere: select every message.
                     let w = NSApp.keyWindow
-                    if w?.firstResponder is NSText || w == nil || w?.sheetParent != nil
+                    let inMailBody = (w?.firstResponder as? NSView).map { v in
+                        sequence(first: v, next: { $0.superview }).contains { $0 is WKWebView }
+                    } ?? false
+                    if w?.firstResponder is NSText || inMailBody || w == nil || w?.sheetParent != nil || store.compose != nil
                         || w?.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true {
                         NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
                     } else {
@@ -51,14 +59,26 @@ struct MinimailApp: App {
             CommandMenu("Message") {
                 Button("Reply") { store.reply() }.keyboardShortcut("r").disabled(store.current == nil)
                 Button("Forward") { store.forward() }.keyboardShortcut("f", modifiers: [.command, .shift]).disabled(store.current == nil)
+                Button("Quick Look Attachments") { store.toggleQuickLook() }
+                    .keyboardShortcut("y")
+                    .disabled(store.current?.attachments.isEmpty ?? true)
                 Divider()
                 Button("Mark as Read") { Task { await store.setRead(true) } }.keyboardShortcut("u", modifiers: [.command, .shift])
                 Button("Mark as Unread") { Task { await store.setRead(false) } }.keyboardShortcut("u", modifiers: [.command, .option])
                 Button("Mark All as Read") { Task { await store.markAllRead() } }.keyboardShortcut("k", modifiers: [.command, .shift])
                 Button(store.activeFolder == .spam ? "Not Spam" : "Move to Spam") { Task { await store.toggleSpam() } }
                     .keyboardShortcut("j", modifiers: [.command, .shift])
-                Button("Delete") { Task { await store.delete() } }
-                    .keyboardShortcut(.delete, modifiers: .command)
+                Button("Delete") {
+                    // In a text field (compose, search) ⌘⌫ deletes to the start of the line,
+                    // it must not trash the selected message (e.g. the one being replied to).
+                    let w = NSApp.keyWindow
+                    if w?.firstResponder is NSText || w?.sheetParent != nil || store.compose != nil {
+                        NSApp.sendAction(#selector(NSResponder.deleteToBeginningOfLine(_:)), to: nil, from: nil)
+                    } else {
+                        Task { await store.delete() }
+                    }
+                }
+                .keyboardShortcut(.delete, modifiers: .command)
                 Divider()
                 Button("Get New Mail") { Task { await store.sync() } }.keyboardShortcut("n", modifiers: [.command, .shift])
             }
@@ -67,11 +87,38 @@ struct MinimailApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var spaceMonitor: Any?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Space bar, like the Finder: Quick Look the attachments of the open message.
+    /// Not while typing (search, compose) or inside the mail body (Space scrolls it there).
+    @MainActor func installSpaceKey(_ store: Store) {
+        guard spaceMonitor == nil else { return }
+        spaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak store] event in
+            guard let store, event.keyCode == 49,
+                  event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return event }
+            if store.quickLookURL != nil {
+                store.quickLookURL = nil
+                return nil
+            }
+            let w = NSApp.keyWindow
+            let inWeb = (w?.firstResponder as? NSView).map { v in
+                sequence(first: v, next: { $0.superview }).contains { $0 is WKWebView }
+            } ?? false
+            guard !(w?.firstResponder is NSText), !inWeb, w?.sheetParent == nil, store.compose == nil,
+                  let m = store.current, !m.attachments.isEmpty, store.selection.count <= 1 else { return event }
+            store.toggleQuickLook()
+            return nil
+        }
+    }
 }
 
 struct ContentView: View {
     @EnvironmentObject var store: Store
+    /// Left edge of the message preview: the compose panel covers everything left of it,
+    /// so the message being answered stays readable while you write.
+    @State private var detailMinX: CGFloat = 0
 
     var body: some View {
         NavigationSplitView {
@@ -80,10 +127,27 @@ struct ContentView: View {
             MessageList().navigationSplitViewColumnWidth(min: 300, ideal: 380)
         } detail: {
             DetailView()
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { detailMinX = g.frame(in: .named("root")).minX }
+                        .onChange(of: g.frame(in: .named("root")).minX) { _, x in detailMinX = x }
+                })
         }
-        .sheet(item: $store.compose) { draft in
-            ComposeView(draft: draft).environmentObject(store)
+        .coordinateSpace(name: "root")
+        .overlay(alignment: .topLeading) {
+            if let draft = store.compose {
+                ComposeView(draft: draft)
+                    .id(draft.id)
+                    .frame(width: max(detailMinX, 480))
+                    .frame(maxHeight: .infinity)
+                    .background(.background)
+                    .overlay(alignment: .trailing) { Divider() }
+                    .shadow(color: .black.opacity(0.12), radius: 8, x: 2)
+                    .transition(.move(edge: .leading))
+            }
         }
+        .animation(.easeOut(duration: 0.18), value: store.compose?.id)
+        .quickLookPreview($store.quickLookURL, in: store.attachmentURLs)
         .sheet(isPresented: $store.showAddAccount) {
             AddAccountView().environmentObject(store)
         }
@@ -271,16 +335,31 @@ struct MessageRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Circle()
-                .fill(message.unread ? Color.accentColor : .clear)
-                .frame(width: 8, height: 8)
-                .padding(.top, 5)
+            VStack(spacing: 5) {
+                Circle()
+                    .fill(message.unread ? Color.accentColor : .clear)
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 5)
+                if message.answered {
+                    Image(systemName: "arrowshape.turn.up.left.fill").help("Replied")
+                }
+                if message.forwarded {
+                    Image(systemName: "arrowshape.turn.up.right.fill").help("Forwarded")
+                }
+            }
+            .font(.system(size: 9))
+            .foregroundStyle(.secondary)
+            .frame(width: 12)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(senderName(folder == .sent ? message.to : message.from))
                         .fontWeight(message.unread ? .semibold : .regular)
                         .lineLimit(1)
                     Spacer(minLength: 6)
+                    if message.attachments {
+                        Image(systemName: "paperclip").font(.caption).foregroundStyle(.secondary)
+                            .help("Has attachments")
+                    }
                     Text(shortDate(message.ts)).font(.caption).foregroundStyle(.secondary)
                 }
                 Text(message.subject.isEmpty ? "(no subject)" : message.subject)
@@ -466,8 +545,7 @@ struct MessageView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             if !message.attachments.isEmpty {
-                Label(message.attachments.map { $0.filename ?? $0.type }.joined(separator: ", "), systemImage: "paperclip")
-                    .font(.caption)
+                AttachmentBar(attachments: message.attachments)
             }
         }
     }
@@ -479,6 +557,82 @@ struct MessageView: View {
         guard let d = ISO8601DateFormatter.flexible.date(from: message.date) ?? ISO8601DateFormatter().date(from: message.date)
                 ?? f.date(from: message.date) else { return message.date }
         return d.formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+/// One chip per attachment. Click or Space: Quick Look. Double-click: open in its app.
+struct AttachmentBar: View {
+    @EnvironmentObject var store: Store
+    let attachments: [Attachment]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "paperclip").foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(Array(attachments.enumerated()), id: \.offset) { i, a in
+                        chip(i, a)
+                    }
+                }
+            }
+            if store.loadingAttachments { ProgressView().controlSize(.mini) }
+            if let i = attachments.firstIndex(where: Self.isCalendar) {
+                Button { Task { await store.addToCalendar(i) } } label: {
+                    Label("Add to Calendar", systemImage: "calendar.badge.plus")
+                }
+                .buttonStyle(.borderless)
+                .help("Open the invitation in Calendar")
+            }
+            if attachments.count > 1 {
+                Button { Task { await store.saveAllAttachments() } } label: {
+                    Label("Save All", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("Save every attachment to Downloads")
+            }
+        }
+        .font(.caption)
+        .textSelection(.disabled)
+    }
+
+    private func chip(_ i: Int, _ a: Attachment) -> some View {
+        HStack(spacing: 4) {
+            Image(nsImage: icon(a)).resizable().frame(width: 16, height: 16)
+            Text(a.filename ?? a.type).lineLimit(1)
+            Text(ByteCountFormatter.string(fromByteCount: Int64(a.size), countStyle: .file)).foregroundStyle(.secondary)
+            Button { Task { await store.saveAttachment(i) } } label: { Image(systemName: "arrow.down.circle") }
+                .buttonStyle(.borderless)
+                .help("Save to Downloads")
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { Task { await store.openAttachment(i) } }
+        .onTapGesture { Task { await store.previewAttachment(i) } }
+        .contextMenu {
+            Button("Quick Look") { Task { await store.previewAttachment(i) } }
+            Button("Open") { Task { await store.openAttachment(i) } }
+            if Self.isCalendar(a) {
+                Button("Add to Calendar") { Task { await store.addToCalendar(i) } }
+            }
+            Button("Save to Downloads") { Task { await store.saveAttachment(i) } }
+        }
+        .help("Click or Space: Quick Look. Double-click: open.")
+    }
+
+    static func isCalendar(_ a: Attachment) -> Bool {
+        let ext = ((a.filename ?? "") as NSString).pathExtension.lowercased()
+        let type = a.type.lowercased()
+        return ext == "ics" || ext == "vcs" || type == "text/calendar" || type == "application/ics"
+    }
+
+    private func icon(_ a: Attachment) -> NSImage {
+        let ext = (a.filename as NSString?)?.pathExtension ?? ""
+        if let t = UTType(filenameExtension: ext) ?? UTType(mimeType: a.type) {
+            return NSWorkspace.shared.icon(for: t)
+        }
+        return NSWorkspace.shared.icon(for: .data)
     }
 }
 
@@ -494,8 +648,8 @@ extension ISO8601DateFormatter {
 
 struct ComposeView: View {
     @EnvironmentObject var store: Store
-    @Environment(\.dismiss) private var dismiss
     @State var draft: Draft
+    @FocusState private var bodyFocused: Bool
     @State private var sending = false
     @State private var error: String?
 
@@ -525,18 +679,17 @@ struct ComposeView: View {
             }
             .padding()
             .zIndex(1)
+            Divider()
             TextEditor(text: $draft.body)
                 .font(.body)
                 .scrollContentBackground(.hidden)
                 .padding(.horizontal, 12)
-                .frame(minHeight: 260)
+                .padding(.top, 8)
+                .frame(maxHeight: .infinity)
+                .focused($bodyFocused)
             if draft.forwardOf != nil {
                 Text("The original email, with its images and attachments, is added below your text.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom, 4)
-            }
-            if draft.replyTo != nil {
-                Text("The original message is quoted below your text.")
-                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
             }
             if let error {
                 Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal).textSelection(.enabled)
@@ -554,8 +707,20 @@ struct ComposeView: View {
             }
             .padding()
         }
-        .frame(width: 620, height: 520)
+        .onAppear {
+            guard draft.replyTo != nil else { return }
+            // Reply: type above the quoted original, with the caret at the very top.
+            bodyFocused = true
+            DispatchQueue.main.async {
+                if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
+                    tv.setSelectedRange(NSRange(location: 0, length: 0))
+                    tv.scrollRangeToVisible(NSRange(location: 0, length: 0))
+                }
+            }
+        }
     }
+
+    private func dismiss() { store.compose = nil }
 
     @State private var showCcBcc = false
 

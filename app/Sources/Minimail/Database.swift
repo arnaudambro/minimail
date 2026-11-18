@@ -67,13 +67,15 @@ final class MailDB {
 
     // MARK: - Queries
 
-    private static let messageColumns = "m.account, m.folder, m.uid, m.sender, m.recipients, m.subject, m.ts, m.unread, m.flagged"
+    private static let messageColumns = "m.account, m.folder, m.uid, m.sender, m.recipients, m.subject, m.ts, m.unread, m.flagged, "
+        + "m.answered, m.forwarded, COALESCE(m.has_att, 0)"
 
     private static func message(_ r: Row) -> Message {
         let account = r.string(0), folder = r.string(1), uid = r.int(2)
         return Message(id: "\(account):\(folder):\(uid)", account: account, folder: folder, uid: uid,
                        from: r.string(3), to: r.string(4), subject: r.string(5), date: "",
-                       ts: r.double(6), unread: r.int(7) != 0, flagged: r.int(8) != 0)
+                       ts: r.double(6), unread: r.int(7) != 0, flagged: r.int(8) != 0,
+                       answered: r.int(9) != 0, forwarded: r.int(10) != 0, attachments: r.int(11) != 0)
     }
 
     static func ftsQuery(_ text: String) -> String {

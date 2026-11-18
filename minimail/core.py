@@ -10,6 +10,7 @@ import shutil
 import smtplib
 import ssl
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -105,6 +106,8 @@ def _summary(acct: Account, folder: str, row: dict) -> dict:
         "ts": ts,
         "unread": "\\seen" not in flags,
         "flagged": "\\flagged" in flags,
+        "answered": "\\answered" in flags,
+        "forwarded": "$forwarded" in flags,
         "message_id": str(h.get("message-id", "") or ""),
     }
 
@@ -339,12 +342,13 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
                 info["unread"] = False
             return info
     with imap.session(acct) as m:
-        imap.select(m, acct, folder, readonly=not mark_read)
+        server_read = mark_read and not acct.local_read
+        imap.select(m, acct, folder, readonly=not server_read)
         rows = imap.fetch(m, [uid], "(UID FLAGS INTERNALDATE BODY.PEEK[])")
         if not rows:
             raise SystemExit(f"Message not found: {mid}")
         row = rows[0]
-        if mark_read:
+        if server_read:
             m.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Seen)")
     body, attachments, msg = parse_full(row["body"])
     info = _summary(acct, folder, {"uid": uid, "flags": row["flags"], "internaldate": row["internaldate"], "body": row["body"]})
@@ -364,6 +368,8 @@ def get_message(mid: str, mark_read=False, live=False) -> dict:
                          str(msg.get("list-unsubscribe", "") or ""), html_of(msg))
         if mark_read:
             store.set_unread(db, account, folder, [uid], False)
+            if acct.local_read:
+                store.set_local_seen(db, account, folder, [uid], True)
     except Exception:  # noqa: BLE001
         pass
     if mark_read:
@@ -377,12 +383,18 @@ def set_seen(ids, seen=True) -> int:
     n = 0
     for (account, folder), uids in group_ids(ids).items():
         acct = get_account(account)
-        with imap.session(acct) as m:
-            imap.select(m, acct, folder, readonly=False)
-            for part in imap.chunks(uids):
-                m.uid("STORE", imap.uidset(part), "+FLAGS.SILENT" if seen else "-FLAGS.SILENT", "(\\Seen)")
-                n += len(part)
-        store.set_unread(store.connect(), account, folder, uids, not seen)
+        db = store.connect()
+        if acct.local_read:
+            # Shared mailbox: only for me, the server's \Seen belongs to the other person.
+            store.set_local_seen(db, account, folder, uids, seen)
+            n += len(uids)
+        else:
+            with imap.session(acct) as m:
+                imap.select(m, acct, folder, readonly=False)
+                for part in imap.chunks(uids):
+                    m.uid("STORE", imap.uidset(part), "+FLAGS.SILENT" if seen else "-FLAGS.SILENT", "(\\Seen)")
+                    n += len(part)
+        store.set_unread(db, account, folder, uids, not seen)
     if seen:
         clear_notifications(ids)
     return n
@@ -392,6 +404,13 @@ def mark_all_read(folder="inbox", accounts=None):
     accts = pick_accounts(accounts)
 
     def one(acct: Account):
+        if acct.local_read:
+            db = store.connect()
+            uids = [r["uid"] for r in db.execute(
+                "SELECT uid FROM messages WHERE account=? AND folder=? AND unread=1", (acct.name, folder))]
+            store.set_local_seen(db, acct.name, folder, uids, True)
+            store.set_all_read(db, acct.name, folder)
+            return len(uids)
         with imap.session(acct) as m:
             imap.select(m, acct, folder, readonly=False)
             uids = imap.search_uids(m, "UNSEEN")
@@ -512,20 +531,49 @@ def delete(ids) -> int:
     return n
 
 
-def fetch_raw(mid: str) -> bytes:
+def fetch_raw(mid: str, m=None) -> bytes:
+    """The raw message. `m`: an open IMAP connection to its account (else one is opened)."""
     account, folder, uid = parse_id(mid)
     acct = get_account(account)
-    with imap.session(acct) as m:
+    if m is not None:
         imap.select(m, acct, folder, readonly=True)
         rows = imap.fetch(m, [uid], "(UID BODY.PEEK[])")
+    else:
+        with imap.session(acct) as m:
+            imap.select(m, acct, folder, readonly=True)
+            rows = imap.fetch(m, [uid], "(UID BODY.PEEK[])")
     if not rows or not rows[0]["body"]:
         raise SystemExit(f"Message not found: {mid}")
     return rows[0]["body"]
 
 
-def _forward_parts(mid: str, note: str):
+def save_attachments(mid: str, dest: str) -> list[dict]:
+    """Write the attachments of message `mid` into `dest`. Returns [{filename, type, size, path}] in message order."""
+    from pathlib import Path
+    out = Path(dest).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    _, _, msg = parse_full(fetch_raw(mid))
+    saved, used = [], set()
+    for i, p in enumerate(msg.iter_attachments()):
+        data = p.get_payload(decode=True) or b""
+        name = Path((p.get_filename() or "").replace("\\", "/")).name.strip().lstrip(".")
+        if not name:
+            ext = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png"}.get(p.get_content_type(), "")
+            name = f"attachment-{i + 1}{ext}"
+        stem, suffix = Path(name).stem, Path(name).suffix
+        n = 2
+        while name.lower() in used or (out / name).exists():
+            name, n = f"{stem} ({n}){suffix}", n + 1
+        used.add(name.lower())
+        path = out / name
+        path.write_bytes(data)
+        saved.append({"filename": name, "type": p.get_content_type(), "size": len(data), "path": str(path)})
+    return saved
+
+
+def _forward_parts(mid: str, note: str, m=None):
     """(subject, text, html or None, attachments) for forwarding message `mid` with a note on top."""
-    text, _, orig = parse_full(fetch_raw(mid))
+    text, _, orig = parse_full(fetch_raw(mid, m))
     get = lambda k: str(orig.get(k, "") or "")  # noqa: E731
     fields = [("From", get("from")), ("Date", get("date")), ("Subject", get("subject")), ("To", get("to"))]
     if get("cc"):
@@ -550,18 +598,127 @@ def _forward_parts(mid: str, note: str):
     return subject, plain, rich, atts
 
 
+def smtp_connect(acct: Account) -> smtplib.SMTP:
+    """Open the SMTP connection. If the configured security fails (e.g. Proton Mail Bridge switched
+    between SSL and STARTTLS on the same port), try the other one before giving up."""
+    ctx = ssl.create_default_context()
+    if acct.insecure_tls:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    def open_(mode: str, timeout: float) -> smtplib.SMTP:
+        if mode == "ssl":
+            return smtplib.SMTP_SSL(acct.smtp_host, acct.smtp_port, context=ctx, timeout=timeout)
+        s = smtplib.SMTP(acct.smtp_host, acct.smtp_port, timeout=timeout)
+        s.starttls(context=ctx)
+        return s
+
+    first = acct.smtp_security
+    try:
+        return open_(first, 30)
+    except (smtplib.SMTPException, ssl.SSLError, TimeoutError, ConnectionError) as e:
+        other = "starttls" if first == "ssl" else "ssl"
+        try:
+            s = open_(other, 15)
+        except Exception:  # noqa: BLE001
+            raise SystemExit(f"SMTP connection to {acct.smtp_host}:{acct.smtp_port} failed ({first}): {e}") from None
+        print(f"warning: SMTP {first} failed, {other} works; run "
+              f"`minimail account edit {acct.name} --smtp-security {other}`", file=sys.stderr)
+        return s
+
+
+def _smtp_login(acct: Account) -> smtplib.SMTP:
+    s = smtp_connect(acct)
+    s.login(acct.username, acct.password())
+    return s
+
+
+def _mark_original(m, mid: str, what: str) -> None:
+    """After a reply / forward: flag the original (\\Answered or $Forwarded) on the server and in the cache."""
+    try:
+        a, f, u = parse_id(mid)
+        acct = get_account(a)
+        if what == "answered":
+            flags = "(\\Answered)" if acct.local_read else "(\\Answered \\Seen)"
+        else:
+            flags = "($Forwarded)"
+        store.set_flag(store.connect(), a, f, [u], what)
+        imap.select(m, acct, f, readonly=False)
+        m.uid("STORE", str(u), "+FLAGS.SILENT", flags)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def quote_original(orig: dict) -> str:
+    """The original under a separator and a short header (From / Sent / To / Cc / Subject), not "> " lines."""
+    sent = orig["date"]
+    try:
+        sent = datetime.fromisoformat(sent.replace("Z", "+00:00")).astimezone().strftime("%A %d %B %Y %H:%M")
+    except (ValueError, TypeError):
+        pass
+    head = [f"From: {orig['from']}", f"Sent: {sent}", f"To: {orig.get('to', '')}"]
+    if orig.get("cc"):
+        head.append(f"Cc: {orig['cc']}")
+    head.append(f"Subject: {orig['subject']}")
+    body = orig["body"].replace("\r\n", "\n").strip("\n")
+    return "-" * 40 + "\n" + "\n".join(head) + "\n\n" + body + "\n"
+
+
 def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: str | None = None,
-         forward_id: str | None = None) -> dict:
+         forward_id: str | None = None, quote: bool = True) -> dict:
     acct = get_account(account)
+    # Every login costs ~1 s (iCloud, Gmail): open SMTP and the IMAP connections in parallel right away,
+    # and use each IMAP connection for everything on that account (fetch the original, save to Sent, flag).
+    pool = ThreadPoolExecutor(max_workers=3)
+    imap_conns: dict = {}
+
+    def imap_for(a: Account):
+        if a.name not in imap_conns:
+            imap_conns[a.name] = pool.submit(imap.connect, a)
+        return imap_conns[a.name]
+
+    smtp_f = pool.submit(_smtp_login, acct)
+    orig_mid = forward_id or reply_to_id
+    orig_acct = get_account(parse_id(orig_mid)[0]) if orig_mid else None
+    if orig_acct:
+        imap_for(orig_acct)
+    if not acct.smtp_saves_sent:
+        imap_for(acct)
+    try:
+        return _send(acct, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote)
+    finally:
+        def close(f):
+            try:
+                f.result().logout()
+            except Exception:  # noqa: BLE001
+                pass
+        list(pool.map(close, list(imap_conns.values())))
+        if smtp_f.done() and not smtp_f.exception():
+            try:
+                smtp_f.result().quit()
+            except Exception:  # noqa: BLE001
+                pass
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _send(acct: Account, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote=True) -> dict:
     msg = EmailMessage()
     rich, atts = None, []
     if forward_id:
-        fsubject, body, rich, atts = _forward_parts(forward_id, body)
+        fa = get_account(parse_id(forward_id)[0])
+        fsubject, body, rich, atts = _forward_parts(forward_id, body, imap_for(fa).result())
         subject = subject or fsubject
     msg["From"] = formataddr((acct.display_name, acct.email)) if acct.display_name else acct.email
     to = list(to)
+    orig = None
     if reply_to_id:
-        orig = get_message(reply_to_id)
+        try:
+            orig = get_message(reply_to_id)
+        except SystemExit as e:
+            # The original was deleted or moved since the reply was opened: still send, without the quote.
+            print(f"warning: {e}; sending without the quoted original", file=sys.stderr)
+            reply_to_id = None
+    if orig:
         if not to:
             to = [orig["reply_to"] or orig["from"]]
         if not subject:
@@ -570,8 +727,8 @@ def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: 
         if orig["message_id"]:
             msg["In-Reply-To"] = orig["message_id"]
             msg["References"] = (orig["references"] + " " + orig["message_id"]).strip()
-        quoted = "\n".join("> " + line for line in orig["body"].splitlines())
-        body = f"{body}\n\nOn {orig['date']}, {orig['from']} wrote:\n{quoted}\n"
+        if quote:
+            body = f"{body}\n\n{quote_original(orig)}"
     if not to:
         raise SystemExit("No recipient.")
     msg["To"] = ", ".join(to)
@@ -586,33 +743,22 @@ def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: 
     for data, maintype, subtype, filename in atts:
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
 
-    ctx = ssl.create_default_context()
-    if acct.insecure_tls:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    if acct.smtp_security == "ssl":
-        s = smtplib.SMTP_SSL(acct.smtp_host, acct.smtp_port, context=ctx, timeout=30)
-    else:
-        s = smtplib.SMTP(acct.smtp_host, acct.smtp_port, timeout=30)
-        s.starttls(context=ctx)
-    with s:
-        s.login(acct.username, acct.password())
-        rcpts = [e for _, e in getaddresses(to + list(cc) + list(bcc))]
-        s.send_message(msg, to_addrs=rcpts)
+    s = smtp_f.result()
+    rcpts = [e for _, e in getaddresses(to + list(cc) + list(bcc))]
+    s.send_message(msg, to_addrs=rcpts)
 
     if not acct.smtp_saves_sent:
-        with imap.session(acct) as m:
-            sent = imap.resolve_folder(m, acct, "sent")
-            m.append(imap.quote(sent), "(\\Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
-    if reply_to_id:
-        try:
-            a, f, u = parse_id(reply_to_id)
-            with imap.session(get_account(a)) as m:
-                imap.select(m, get_account(a), f, readonly=False)
-                m.uid("STORE", str(u), "+FLAGS.SILENT", "(\\Answered \\Seen)")
-        except Exception:  # noqa: BLE001
-            pass
-    return {"account": account, "to": to, "cc": list(cc), "subject": subject, "message_id": msg["Message-ID"]}
+        m = imap_for(acct).result()
+        sent = imap.resolve_folder(m, acct, "sent")
+        m.append(imap.quote(sent), "(\\Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+    for mid, what in ((reply_to_id, "answered"), (forward_id, "forwarded")):
+        if mid:
+            try:
+                m = imap_for(get_account(parse_id(mid)[0])).result()
+            except Exception:  # noqa: BLE001
+                continue
+            _mark_original(m, mid, what)
+    return {"account": acct.name, "to": to, "cc": list(cc), "subject": subject, "message_id": msg["Message-ID"]}
 
 
 # ---------------------------------------------------------------- notifications

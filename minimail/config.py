@@ -85,6 +85,9 @@ class Account:
     smtp_saves_sent: bool = False
     insecure_tls: bool = False
     enabled: bool = True
+    # Shared mailbox: read/unread is kept only in the local cache, never written to the server
+    # (\Seen stays for the other person). New mail arrives unread here even if they already read it.
+    local_read: bool = False
     # Optional overrides: {"sent": "Sent Messages", "spam": "Junk"}
     folders: dict = field(default_factory=dict)
 

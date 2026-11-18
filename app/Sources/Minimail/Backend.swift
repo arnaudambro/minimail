@@ -14,6 +14,9 @@ struct Message: Codable, Identifiable, Hashable {
     let ts: Double
     var unread: Bool
     let flagged: Bool
+    var answered = false
+    var forwarded = false
+    var attachments = false
 }
 
 struct ListResponse: Codable {
@@ -57,7 +60,9 @@ struct AccountInfo: Codable, Identifiable, Hashable {
     let email: String
     let provider: String
     let enabled: Bool
+    var local_read: Bool? = nil
     var id: String { name }
+    var localRead: Bool { local_read ?? false }
 }
 
 struct ProviderInfo: Codable, Identifiable, Hashable {

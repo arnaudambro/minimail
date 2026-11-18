@@ -25,7 +25,8 @@ MAX_BODY_SIZE = 3_000_000
 
 HEADER_ITEMS = ("(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS "
                 "(FROM TO CC SUBJECT DATE MESSAGE-ID REPLY-TO REFERENCES LIST-UNSUBSCRIBE)])")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+BODYSTRUCTURES_PER_PASS = 2000  # attachment detection for messages cached before v4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -34,12 +35,17 @@ CREATE TABLE IF NOT EXISTS messages(
   message_id TEXT, sender TEXT, recipients TEXT, cc TEXT, reply_to TEXT, refs TEXT,
   subject TEXT, ts REAL, unread INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0,
   size INTEGER, body TEXT, attachments TEXT, list_unsub TEXT, html TEXT,
+  answered INTEGER NOT NULL DEFAULT 0, forwarded INTEGER NOT NULL DEFAULT 0, has_att INTEGER,
   UNIQUE(account, folder, uid));
 CREATE INDEX IF NOT EXISTS messages_folder_ts ON messages(folder, ts DESC);
 CREATE INDEX IF NOT EXISTS messages_account_folder_ts ON messages(account, folder, ts DESC);
 CREATE TABLE IF NOT EXISTS folders(
   account TEXT NOT NULL, folder TEXT NOT NULL, uidvalidity TEXT, synced REAL,
   PRIMARY KEY(account, folder));
+-- Shared mailboxes (Account.local_read): messages I read, by Message-ID, so a message keeps
+-- my read state when it moves between folders (spam, trash, undo) and gets a new UID.
+CREATE TABLE IF NOT EXISTS local_seen(
+  account TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(account, message_id));
 CREATE TABLE IF NOT EXISTS contacts(
   email TEXT PRIMARY KEY, name TEXT, received INTEGER NOT NULL DEFAULT 0,
   sent INTEGER NOT NULL DEFAULT 0, last REAL NOT NULL DEFAULT 0);
@@ -89,6 +95,11 @@ def _migrate(db) -> None:
     if "html" not in cols:
         # NULL = not parsed yet (filled by the prefetch or on open), '' = the message has no HTML part.
         db.execute("ALTER TABLE messages ADD COLUMN html TEXT")
+    for col, decl in (("answered", "INTEGER NOT NULL DEFAULT 0"), ("forwarded", "INTEGER NOT NULL DEFAULT 0"),
+                      ("has_att", "INTEGER")):
+        # has_att: NULL = not known yet (the sync reads BODYSTRUCTURE), 0 / 1.
+        if col not in cols:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
     if version < 2:
         # v2 keeps links in bodies: parse them again (prefetch refills them progressively).
         db.execute("UPDATE messages SET body=NULL, attachments=NULL")
@@ -108,6 +119,7 @@ def row_to_summary(r: sqlite3.Row) -> dict:
         "from": r["sender"] or "", "to": r["recipients"] or "", "subject": r["subject"] or "",
         "date": datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat(timespec="minutes") if ts else "",
         "ts": ts, "unread": bool(r["unread"]), "flagged": bool(r["flagged"]),
+        "answered": bool(r["answered"]), "forwarded": bool(r["forwarded"]), "attachments": bool(r["has_att"]),
         "message_id": r["message_id"] or "",
     }
 
@@ -177,6 +189,28 @@ def set_unread(db, account: str, folder: str, uids, unread: bool) -> None:
     db.commit()
 
 
+def set_flag(db, account: str, folder: str, uids, column: str, on: bool = True) -> None:
+    assert column in ("answered", "forwarded")
+    db.executemany(f"UPDATE messages SET {column}=? WHERE account=? AND folder=? AND uid=?",
+                   [(int(on), account, folder, u) for u in uids])
+    db.commit()
+
+
+def set_local_seen(db, account: str, folder: str, uids, seen: bool) -> None:
+    """Shared mailbox: remember (or forget) that I read these messages, by Message-ID."""
+    uids = list(uids)
+    if not uids:
+        return
+    mids = [(account, r["message_id"]) for r in db.execute(
+        f"SELECT message_id FROM messages WHERE account=? AND folder=? AND uid IN ({','.join('?' * len(uids))}) "
+        "AND COALESCE(message_id, '') != ''", [account, folder, *uids])]
+    if seen:
+        db.executemany("INSERT OR IGNORE INTO local_seen(account, message_id) VALUES (?, ?)", mids)
+    else:
+        db.executemany("DELETE FROM local_seen WHERE account=? AND message_id=?", mids)
+    db.commit()
+
+
 def set_all_read(db, account: str, folder: str) -> None:
     db.execute("UPDATE messages SET unread=0 WHERE account=? AND folder=? AND unread=1", (account, folder))
     db.commit()
@@ -200,6 +234,7 @@ def forget_account(name: str) -> None:
     db = connect()
     db.execute("DELETE FROM messages WHERE account=?", (name,))
     db.execute("DELETE FROM folders WHERE account=?", (name,))
+    db.execute("DELETE FROM local_seen WHERE account=?", (name,))
     db.commit()
 
 
@@ -212,7 +247,8 @@ def _header_row(acct: Account, key: str, r: dict) -> tuple:
     get = lambda k: str(h.get(k, "") or "")  # noqa: E731
     return (acct.name, key, r["uid"], get("message-id"), get("from"), get("to"), get("cc"), get("reply-to"),
             get("references"), get("subject"), _ts(r["internaldate"], h.get("date")),
-            int("\\seen" not in flags), int("\\flagged" in flags), r.get("size"), get("list-unsubscribe"))
+            int("\\seen" not in flags), int("\\flagged" in flags), r.get("size"), get("list-unsubscribe"),
+            int("\\answered" in flags), int("$forwarded" in flags))
 
 
 def _update_contacts(db, rows: list[tuple]) -> None:
@@ -246,8 +282,8 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
         first = True
 
     server = set(imap.search_uids(m, "ALL"))
-    cached = {r["uid"]: (r["unread"], r["flagged"]) for r in
-              db.execute("SELECT uid, unread, flagged FROM messages WHERE account=? AND folder=?", (acct.name, key))}
+    cached = {r["uid"]: (r["unread"], r["flagged"], r["answered"], r["forwarded"]) for r in
+              db.execute("SELECT uid, unread, flagged, answered, forwarded FROM messages WHERE account=? AND folder=?", (acct.name, key))}
 
     gone = [u for u in cached if u not in server]
     if gone:
@@ -259,20 +295,51 @@ def sync_folder(db, m, acct: Account, key: str, bodies: int = BODIES_PER_PASS) -
         rows = [_header_row(acct, key, r) for r in imap.fetch(m, part, HEADER_ITEMS)]
         db.executemany(
             "INSERT OR IGNORE INTO messages(account, folder, uid, message_id, sender, recipients, cc, reply_to, refs, "
-            "subject, ts, unread, flagged, size, list_unsub) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "subject, ts, unread, flagged, size, list_unsub, answered, forwarded) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         _update_contacts(db, rows)
         db.commit()
         if not first:
             inserted += [{"uid": r[2], "unread": bool(r[11])} for r in rows]
+    if acct.local_read and inserted and key != "sent":
+        # Shared mailbox: new mail is unread for me, whatever the other person did on the server,
+        # unless I already read it in another folder (moved to spam / trash and back).
+        db.executemany("UPDATE messages SET unread=NOT EXISTS (SELECT 1 FROM local_seen s WHERE s.account=messages.account "
+                       "AND s.message_id=messages.message_id) WHERE account=? AND folder=? AND uid=?",
+                       [(acct.name, key, x["uid"]) for x in inserted])
+        db.commit()
 
-    # Flags: two cheap searches instead of fetching every message's flags.
+    # Flags: a few cheap searches instead of fetching every message's flags.
+    # Shared mailbox: the server's \Seen belongs to the other person, keep my own read state.
     if cached:
         unseen = set(imap.search_uids(m, "UNSEEN"))
         flagged = set(imap.search_uids(m, "FLAGGED"))
-        changes = [(int(u in unseen), int(u in flagged), acct.name, key, u)
-                   for u, (ur, fl) in cached.items() if u in server and (ur != int(u in unseen) or fl != int(u in flagged))]
+        answered = set(imap.search_uids(m, "ANSWERED"))
+        try:
+            forwarded = set(imap.search_uids(m, "KEYWORD", "$Forwarded"))
+        except Exception:  # noqa: BLE001
+            forwarded = None
+        changes = []
+        for u, old in cached.items():
+            if u not in server:
+                continue
+            new_row = (old[0] if acct.local_read else int(u in unseen), int(u in flagged), int(u in answered),
+                       old[3] if forwarded is None else int(u in forwarded))
+            if new_row != old:
+                changes.append((*new_row, acct.name, key, u))
         if changes:
-            db.executemany("UPDATE messages SET unread=?, flagged=? WHERE account=? AND folder=? AND uid=?", changes)
+            db.executemany("UPDATE messages SET unread=?, flagged=?, answered=?, forwarded=? "
+                           "WHERE account=? AND folder=? AND uid=?", changes)
+
+    # Attachments: BODYSTRUCTURE is small and tells it without downloading the message.
+    unknown = [r["uid"] for r in db.execute(
+        "SELECT uid FROM messages WHERE account=? AND folder=? AND has_att IS NULL ORDER BY ts DESC LIMIT ?",
+        (acct.name, key, BODYSTRUCTURES_PER_PASS))]
+    if unknown:
+        found = imap.fetch_bodystructures(m, unknown)
+        db.executemany("UPDATE messages SET has_att=? WHERE account=? AND folder=? AND uid=?",
+                       [(int(imap.has_attachment(found.get(u))), acct.name, key, u) for u in unknown])
+        db.commit()
 
     # Text bodies, newest first, so opening and searching recent mail is instant.
     if bodies:

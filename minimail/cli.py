@@ -107,7 +107,7 @@ def cmd_account_list(a):
     if not accts:
         print("No accounts. Add one with `minimail account add`.")
     for x in accts:
-        flag = "" if x.enabled else "  (disabled)"
+        flag = ("" if x.enabled else "  (disabled)") + ("  (local read)" if x.local_read else "")
         print(f"{x.name:<16} {x.email:<38} {x.provider:<14} {x.imap_host}:{x.imap_port}{flag}")
 
 
@@ -148,6 +148,15 @@ def _edit(name, fn):
 def cmd_account_enable(a, enabled):
     _edit(a.name, lambda x: setattr(x, "enabled", enabled))
     print(f"{a.name} {'enabled' if enabled else 'disabled'}.")
+
+
+def cmd_account_local_read(a):
+    on = a.state == "on"
+    _edit(a.name, lambda x: setattr(x, "local_read", on))
+    if a.json:
+        return out_json({"name": a.name, "local_read": on})
+    print(f"{a.name}: read/unread is now " + ("kept on this Mac only (the server is not changed)." if on
+                                              else "synced with the server."))
 
 
 def cmd_account_edit(a):
@@ -218,6 +227,16 @@ def cmd_show(a):
         print("Attach:  " + ", ".join(f"{x['filename']} ({x['size']} B)" for x in m["attachments"]))
     print("─" * 60)
     print(m["body"])
+
+
+def cmd_attachments(a):
+    saved = core.save_attachments(a.id, a.dir)
+    if a.json:
+        return out_json(saved)
+    if not saved:
+        print("No attachments.")
+    for x in saved:
+        print(f"{x['path']}  ({x['size']} B)")
 
 
 def cmd_mark(a, seen):
@@ -314,7 +333,8 @@ def cmd_counts(a):
 
 def cmd_send(a):
     body = a.body if a.body is not None else sys.stdin.read()
-    r = core.send(a.account, a.to or [], a.subject or "", body, a.cc or [], a.bcc or [], a.reply, a.forward)
+    r = core.send(a.account, a.to or [], a.subject or "", body, a.cc or [], a.bcc or [], a.reply, a.forward,
+                  quote=not a.no_quote)
     print(json.dumps(r) if a.json else f"Sent to {', '.join(r['to'])}: {r['subject']}")
 
 
@@ -440,6 +460,9 @@ def build_parser():
     s.set_defaults(fn=cmd_account_edit)
     s = acc.add_parser("enable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, True))
     s = acc.add_parser("disable"); s.add_argument("name"); s.set_defaults(fn=lambda a: cmd_account_enable(a, False))
+    s = j(acc.add_parser("local-read", help="shared mailbox: mark read/unread on this Mac only, never on the server"))
+    s.add_argument("name"); s.add_argument("state", choices=["on", "off"])
+    s.set_defaults(fn=cmd_account_local_read)
     s = acc.add_parser("folder", help="override the server folder used for sent/spam")
     s.add_argument("name"); s.add_argument("key", choices=["sent", "spam"]); s.add_argument("folder")
     s.set_defaults(fn=cmd_account_folder)
@@ -461,6 +484,10 @@ def build_parser():
     s = j(sub.add_parser("show", help="print one message (does not mark it read)"))
     s.add_argument("id"); s.add_argument("--mark-read", action="store_true"); s.add_argument("--live", action="store_true")
     s.set_defaults(fn=cmd_show)
+
+    s = j(sub.add_parser("attachments", help="save a message's attachments to a folder"))
+    s.add_argument("id"); s.add_argument("--dir", "-d", default="~/Downloads", help="destination folder (default: ~/Downloads)")
+    s.set_defaults(fn=cmd_attachments)
 
     for name, seen in (("mark-read", True), ("mark-unread", False)):
         s = j(sub.add_parser(name))
@@ -504,6 +531,7 @@ def build_parser():
     s.add_argument("--subject")
     s.add_argument("--body")
     s.add_argument("--reply", metavar="ID", help="reply to this message id (fills To/Subject/threading)")
+    s.add_argument("--no-quote", action="store_true", help="with --reply: do not append the quoted original (the body already has it)")
     s.add_argument("--forward", metavar="ID", help="forward this message id (body = your note on top; keeps HTML and attachments)")
     s.set_defaults(fn=cmd_send)
 

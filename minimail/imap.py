@@ -7,6 +7,7 @@ import imaplib
 import json
 import re
 import ssl
+import time
 from contextlib import contextmanager
 
 from .config import STATE_DIR, Account
@@ -36,6 +37,28 @@ def _ssl_context(acct: Account) -> ssl.SSLContext:
 
 def connect(acct: Account) -> imaplib.IMAP4:
     ctx = _ssl_context(acct)
+    if acct.imap_security == "ssl":
+        m = imaplib.IMAP4_SSL(acct.imap_host, acct.imap_port, ssl_context=ctx, timeout=30)
+    else:
+        m = imaplib.IMAP4(acct.imap_host, acct.imap_port, timeout=30)
+        m.starttls(ssl_context=ctx)
+    try:
+        m.login(acct.username, acct.password())
+    except imaplib.IMAP4.error as e:
+        # iCloud (and others) sometimes refuse a good password for a few seconds when many
+        # connections log in at once: try once more before reporting a wrong password.
+        if "AUTHENTICATIONFAILED" not in str(e).upper():
+            raise
+        try:
+            m.logout()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(3)
+        return _login_again(acct, ctx)
+    return m
+
+
+def _login_again(acct: Account, ctx) -> imaplib.IMAP4:
     if acct.imap_security == "ssl":
         m = imaplib.IMAP4_SSL(acct.imap_host, acct.imap_port, ssl_context=ctx, timeout=30)
     else:
@@ -224,3 +247,113 @@ def fetch(m: imaplib.IMAP4, uids, items: str) -> list[dict]:
                 })
             i += 1
     return out
+
+
+# ---------------------------------------------------------------- BODYSTRUCTURE
+
+_FETCH_START_RE = re.compile(rb"^\d+ \(")
+_LITERAL_END_RE = re.compile(rb"\{\d+\}$")
+
+
+def fetch_bodystructures(m: imaplib.IMAP4, uids) -> dict[int, bytes]:
+    """{uid: raw BODYSTRUCTURE response line}. Literals (e.g. non-ASCII file names) are inlined as strings."""
+    out: dict[int, bytes] = {}
+    for part in chunks(uids, 200):
+        typ, data = m.uid("FETCH", uidset(part), "(UID BODYSTRUCTURE)")
+        if typ != "OK":
+            continue
+        lines: list[bytes] = []
+        for item in data or []:
+            if isinstance(item, tuple):
+                head = _LITERAL_END_RE.sub(b"", item[0])
+                lit = b'"' + item[1].replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+                if _FETCH_START_RE.match(head) or not lines:
+                    lines.append(head + lit)
+                else:
+                    lines[-1] += head + lit
+            elif isinstance(item, bytes) and item:
+                if _FETCH_START_RE.match(item) or not lines:
+                    lines.append(item)
+                else:
+                    lines[-1] += item
+        for line in lines:
+            mu = _UID_RE.search(line)
+            i = line.find(b"BODYSTRUCTURE ")
+            if mu and i >= 0:
+                out[int(mu.group(1))] = line[i + len(b"BODYSTRUCTURE "):]
+    return out
+
+
+_TOKEN_RE = re.compile(rb'\s*(?:(\()|(\))|"((?:[^"\\]|\\.)*)"|([^\s()"]+))')
+
+
+def _parse_sexp(raw: bytes):
+    """Parse an IMAP parenthesized list into nested Python lists of str / None."""
+    stack: list[list] = [[]]
+    pos = 0
+    while pos < len(raw):
+        mt = _TOKEN_RE.match(raw, pos)
+        if not mt or mt.end() == pos:
+            break
+        pos = mt.end()
+        if mt.group(1):
+            stack.append([])
+        elif mt.group(2):
+            if len(stack) == 1:
+                break
+            done = stack.pop()
+            stack[-1].append(done)
+            if len(stack) == 1:
+                break
+        elif mt.group(3) is not None:
+            stack[-1].append(re.sub(rb"\\(.)", rb"\1", mt.group(3)).decode("utf-8", "replace"))
+        else:
+            atom = mt.group(4).decode("utf-8", "replace")
+            stack[-1].append(None if atom.upper() == "NIL" else atom)
+    return stack[0][0] if stack[0] else None
+
+
+_NOT_ATTACHMENTS = {"application/pkcs7-signature", "application/x-pkcs7-signature", "application/pgp-signature",
+                    "application/pgp-encrypted", "application/pgp-keys"}
+
+
+def _part_has_attachment(node, parent: str = "mixed") -> bool:
+    if not isinstance(node, list) or not node:
+        return False
+    if isinstance(node[0], list):  # multipart: children first, then the subtype
+        sub = next((x.lower() for x in node if isinstance(x, str)), "mixed")
+        # (extension lists after the subtype, like ("boundary" "x"), never look like an attachment)
+        return any(_part_has_attachment(c, sub) for c in node if isinstance(c, list))
+    if len(node) < 2 or not isinstance(node[0], str) or not isinstance(node[1], str):
+        return False
+    ctype = f"{node[0]}/{node[1]}".lower()
+    if ctype in _NOT_ATTACHMENTS:
+        return False
+    if ctype == "message/rfc822":
+        return True
+    params = node[2] if len(node) > 2 and isinstance(node[2], list) else []
+    has_name = any(isinstance(k, str) and k.lower() == "name" for k in params[::2])
+    disposition = None
+    for x in node[7:]:
+        if isinstance(x, list) and x and isinstance(x[0], str) and x[0].lower() in ("attachment", "inline"):
+            disposition = x[0].lower()
+            if len(x) > 1 and isinstance(x[1], list):
+                has_name = has_name or any(isinstance(k, str) and k.lower() == "filename" for k in x[1][::2])
+            break
+    if disposition == "attachment":
+        return True
+    if ctype.startswith("text/") and disposition != "attachment":
+        return False  # the body (plain / HTML / calendar text)
+    if ctype.startswith("image/") and parent == "related":
+        return False  # a picture shown inside the HTML (logo, signature)
+    # Apple Mail sends PDFs and photos as "inline" with a file name: still attachments.
+    return has_name
+
+
+def has_attachment(raw: bytes | None) -> bool:
+    if not raw:
+        return False
+    try:
+        return _part_has_attachment(_parse_sexp(raw))
+    except Exception:  # noqa: BLE001
+        return False
