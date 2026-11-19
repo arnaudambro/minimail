@@ -649,7 +649,6 @@ extension ISO8601DateFormatter {
 struct ComposeView: View {
     @EnvironmentObject var store: Store
     @State var draft: Draft
-    @FocusState private var bodyFocused: Bool
     @State private var sending = false
     @State private var error: String?
 
@@ -676,17 +675,17 @@ struct ComposeView: View {
                     row("Bcc") { AddressField(placeholder: "Hidden copy to", text: $draft.bcc) }.zIndex(3)
                 }
                 row("Subject") { TextField("", text: $draft.subject).textFieldStyle(.roundedBorder) }.zIndex(2)
+                if !draft.files.isEmpty {
+                    ComposeAttachments(files: $draft.files)
+                }
             }
             .padding()
             .zIndex(1)
             Divider()
-            TextEditor(text: $draft.body)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, 12)
+            BodyEditor(text: $draft.body, caretAtStart: draft.replyTo != nil) { attach(from: $0) }
+                .padding(.leading, 12)
                 .padding(.top, 8)
                 .frame(maxHeight: .infinity)
-                .focused($bodyFocused)
             if draft.forwardOf != nil {
                 Text("The original email, with its images and attachments, is added below your text.")
                     .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom, 4)
@@ -707,16 +706,61 @@ struct ComposeView: View {
             }
             .padding()
         }
-        .onAppear {
-            guard draft.replyTo != nil else { return }
-            // Reply: type above the quoted original, with the caret at the very top.
-            bodyFocused = true
-            DispatchQueue.main.async {
-                if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
-                    tv.setSelectedRange(NSRange(location: 0, length: 0))
-                    tv.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        // Files dropped anywhere on the panel (the text area handles its own drops).
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            for p in providers {
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { DispatchQueue.main.async { add([url]) } }
                 }
             }
+            return true
+        }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: 3).padding(2)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    @State private var dropTargeted = false
+
+    /// Paste or drop on the text: attach files and images. Returns false to let text paste normally.
+    private func attach(from pb: NSPasteboard) -> Bool {
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            add(urls)
+            return true
+        }
+        // Text wins over images: apps often copy a picture of the selection along with its text.
+        guard pb.string(forType: .string) == nil,
+              let image = NSImage(pasteboard: pb),
+              let tiff = image.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return false }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Minimail/pasted/\(UUID().uuidString)", isDirectory: true)
+        let url = dir.appendingPathComponent("Image \(f.string(from: Date())).png")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try png.write(to: url)
+            add([url])
+        } catch {
+            self.error = "Could not attach the image: \(error.localizedDescription)"
+        }
+        return true
+    }
+
+    private func add(_ urls: [URL]) {
+        for u in urls {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                error = "Folders cannot be attached: \(u.lastPathComponent). Compress it first."
+                continue
+            }
+            if !draft.files.contains(u) { draft.files.append(u) }
         }
     }
 
@@ -743,6 +787,141 @@ struct ComposeView: View {
     }
 }
 
+/// Files that will be sent with the new email. Double-click opens one; × removes it.
+struct ComposeAttachments: View {
+    @Binding var files: [URL]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "paperclip").foregroundStyle(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(files, id: \.self) { url in
+                        HStack(spacing: 4) {
+                            Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 16, height: 16)
+                            Text(url.lastPathComponent).lineLimit(1)
+                            Text(size(url)).foregroundStyle(.secondary)
+                            Button { files.removeAll { $0 == url } } label: { Image(systemName: "xmark.circle") }
+                                .buttonStyle(.borderless)
+                                .help("Remove this attachment")
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { NSWorkspace.shared.open(url) }
+                        .help(url.path)
+                    }
+                }
+            }
+        }
+        .font(.caption)
+    }
+
+    private func size(_ url: URL) -> String {
+        let n = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    }
+}
+
+/// Plain-text body editor. Unlike TextEditor, it turns dropped files and pasted
+/// screenshots into attachments (through `onAttach`) instead of inserting paths.
+struct BodyEditor: NSViewRepresentable {
+    @Binding var text: String
+    /// Reply: type above the quoted original, with the caret at the very top.
+    var caretAtStart = false
+    var onAttach: (NSPasteboard) -> Bool
+
+    final class TextView: NSTextView {
+        var onAttach: ((NSPasteboard) -> Bool)?
+        var focusOnWindow = false
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard focusOnWindow, let window else { return }
+            focusOnWindow = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                window.makeFirstResponder(self)
+                self.setSelectedRange(NSRange(location: 0, length: 0))
+                self.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            }
+        }
+
+        override func paste(_ sender: Any?) {
+            if onAttach?(.general) == true { return }
+            super.paste(sender)
+        }
+
+        private func hasFiles(_ info: NSDraggingInfo) -> Bool {
+            info.draggingSource as? NSTextView !== self
+                && info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        }
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            hasFiles(sender) ? .copy : super.draggingEntered(sender)
+        }
+
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            hasFiles(sender) ? .copy : super.draggingUpdated(sender)
+        }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            if hasFiles(sender), onAttach?(sender.draggingPasteboard) == true { return true }
+            return super.performDragOperation(sender)
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: BodyEditor
+        init(_ parent: BodyEditor) { self.parent = parent }
+        func textDidChange(_ n: Notification) {
+            guard let tv = n.object as? NSTextView else { return }
+            parent.text = tv.string
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        let tv = TextView(frame: .zero)
+        tv.isRichText = false
+        tv.importsGraphics = false
+        tv.allowsUndo = true
+        tv.drawsBackground = false
+        tv.font = .systemFont(ofSize: NSFont.systemFontSize)
+        tv.textColor = .labelColor
+        tv.textContainerInset = NSSize(width: 0, height: 0)
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.minSize = .zero
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        tv.string = text
+        tv.delegate = context.coordinator
+        tv.onAttach = onAttach
+        tv.focusOnWindow = caretAtStart
+        scroll.documentView = tv
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let tv = scroll.documentView as? TextView else { return }
+        tv.onAttach = onAttach
+        if tv.string != text {
+            let sel = tv.selectedRange()
+            tv.string = text
+            tv.setSelectedRange(NSRange(location: min(sel.location, (text as NSString).length), length: 0))
+        }
+    }
+}
 
 // MARK: - Address autocomplete
 

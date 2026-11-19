@@ -24,6 +24,8 @@ struct Draft: Identifiable {
     var body = ""
     var replyTo: String?
     var forwardOf: String?
+    /// Local files to attach (dropped, pasted, or pasted screenshots saved to a temporary folder).
+    var files: [URL] = []
 }
 
 @MainActor
@@ -554,6 +556,7 @@ final class Store: ObservableObject {
         }
         if let r = d.replyTo { args += ["--reply", r, "--no-quote"] }
         if let f = d.forwardOf { args += ["--forward", f] }
+        for f in d.files { args += ["--attach", f.path] }
         _ = try await CLI.run(args, input: d.body)
     }
 

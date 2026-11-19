@@ -5,6 +5,8 @@ from __future__ import annotations
 import html
 from html.parser import HTMLParser
 import imaplib
+import mimetypes
+import os
 import re
 import shutil
 import smtplib
@@ -665,8 +667,9 @@ def quote_original(orig: dict) -> str:
 
 
 def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: str | None = None,
-         forward_id: str | None = None, quote: bool = True) -> dict:
+         forward_id: str | None = None, quote: bool = True, attach=()) -> dict:
     acct = get_account(account)
+    files = _read_attachments(attach)
     # Every login costs ~1 s (iCloud, Gmail): open SMTP and the IMAP connections in parallel right away,
     # and use each IMAP connection for everything on that account (fetch the original, save to Sent, flag).
     pool = ThreadPoolExecutor(max_workers=3)
@@ -685,7 +688,7 @@ def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: 
     if not acct.smtp_saves_sent:
         imap_for(acct)
     try:
-        return _send(acct, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote)
+        return _send(acct, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote, files)
     finally:
         def close(f):
             try:
@@ -701,7 +704,24 @@ def send(account: str, to, subject: str, body: str, cc=(), bcc=(), reply_to_id: 
         pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _send(acct: Account, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote=True) -> dict:
+def _read_attachments(paths) -> list[tuple]:
+    """[(data, maintype, subtype, filename)] for local files to attach. Fails before anything is sent."""
+    out = []
+    for p in paths or ():
+        path = os.path.expanduser(p)
+        if not os.path.isfile(path):
+            raise SystemExit(f"Attachment not found: {p}")
+        ctype, enc = mimetypes.guess_type(path)
+        if not ctype or enc:
+            ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        with open(path, "rb") as f:
+            out.append((f.read(), maintype, subtype, os.path.basename(path)))
+    return out
+
+
+def _send(acct: Account, to, subject, body, cc, bcc, reply_to_id, forward_id, smtp_f, imap_for, quote=True,
+          files=()) -> dict:
     msg = EmailMessage()
     rich, atts = None, []
     if forward_id:
@@ -740,7 +760,7 @@ def _send(acct: Account, to, subject, body, cc, bcc, reply_to_id, forward_id, sm
     msg.set_content(body)
     if rich:
         msg.add_alternative(rich, subtype="html")
-    for data, maintype, subtype, filename in atts:
+    for data, maintype, subtype, filename in list(atts) + list(files):
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
 
     s = smtp_f.result()

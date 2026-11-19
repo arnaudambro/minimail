@@ -46,6 +46,7 @@ minimail send -a perso --to someone@example.com --subject "Hi" --body "Text"
 echo "Long body" | minimail send -a perso --to a@example.com --subject "Hi"
 minimail send -a perso --reply perso:inbox:48213 --body "Thanks!"   # threaded reply, quotes original
 minimail send -a perso --forward perso:inbox:48213 --to a@example.com --body "FYI"  # keeps HTML + attachments
+minimail send -a perso --to a@example.com --subject "Docs" --body "Here" --attach ~/f.pdf --attach ~/g.png
 ```
 
 Rules:
